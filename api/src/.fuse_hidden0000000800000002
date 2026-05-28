@@ -1,0 +1,72 @@
+import { readFileSync, watch } from 'node:fs';
+import { resolve } from 'node:path';
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import { config } from './config.js';
+import { createDataStore } from './store/index.js';
+import { referenceRoutes } from './routes/reference.js';
+import { locListRoutes } from './routes/locLists.js';
+import { skuListRoutes } from './routes/skuLists.js';
+import { priceChangeRoutes } from './routes/priceChanges.js';
+import { pricingRoutes } from './routes/pricing.js';
+import { calendarRoutes } from './routes/calendar.js';
+import { aiRoutes } from './routes/ai.js';
+import { fiscalRoutes } from './routes/fiscal.js';
+import { storeViewRoutes } from './routes/storeView.js';
+import { rezoneRoutes } from './routes/rezone.js';
+import { dashboardRoutes } from './routes/dashboard.js';
+import { anthropicConfigured, resetAnthropic } from './ai/client.js';
+
+// Re-parse .env into process.env without a restart, then reset the AI client.
+function reloadEnv(log: (m: string) => void) {
+  try {
+    const path = resolve(process.cwd(), '.env');
+    const text = readFileSync(path, 'utf8');
+    for (const line of text.split('\n')) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+      if (!m) continue;
+      const key = m[1]!;
+      let val = m[2]!.trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+      process.env[key] = val;
+    }
+    resetAnthropic();
+    log(`reloaded .env (AI ${anthropicConfigured() ? 'live' : 'stub'})`);
+  } catch { /* .env may not exist; ignore */ }
+}
+
+async function main() {
+  const app = Fastify({ logger: true });
+  await app.register(cors, { origin: true });
+
+  const ds = await createDataStore();
+  app.log.info(`datastore=${config.datastore}`);
+
+  app.get('/health', async () => ({ ok: true, datastore: config.datastore, anthropicConfigured: anthropicConfigured() }));
+
+  await referenceRoutes(app, ds);
+  await locListRoutes(app, ds);
+  await skuListRoutes(app, ds);
+  await priceChangeRoutes(app, ds);
+  await pricingRoutes(app, ds);
+  await calendarRoutes(app, ds);
+  await aiRoutes(app, ds);
+  await fiscalRoutes(app);
+  await storeViewRoutes(app, ds);
+  await rezoneRoutes(app, ds);
+  await dashboardRoutes(app, ds);
+
+  // Watch .env so editing the API key applies live (no manual restart).
+  try {
+    const envPath = resolve(process.cwd(), '.env');
+    let t: NodeJS.Timeout | null = null;
+    watch(envPath, () => { if (t) clearTimeout(t); t = setTimeout(() => reloadEnv((m) => app.log.info(m)), 200); });
+    app.log.info('watching .env for changes');
+  } catch { /* ignore if unwatchable */ }
+
+  const close = async () => { app.log.info('shutting down…'); await ds.shutdown(); await app.close(); process.exit(0); };
+  process.on('SIGINT', close);
+  process.on('SIGTERM', close);
+  await app.listen({ port: config.port, host: config.host });
+}
+main().catch((err) => { console.error(err); process.exit(1); });

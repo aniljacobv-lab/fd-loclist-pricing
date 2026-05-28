@@ -1,0 +1,259 @@
+import type { FastifyInstance } from 'fastify';
+import type { DataStore } from '../store/datastore.js';
+import { pcPriceForSku } from '../store/datastore.js';
+import type { PriceChange } from '../types.js';
+
+// "My View" analytics: pick a Store / Region / Zone / Department and see the
+// current price points by category, plus the promotions and clearances running
+// in that scope. Read-only — derived from the catalog, web-sourced promos
+// (items.json promoLabel), and PROMOTED price changes touching the scope.
+//
+// NOTE: aggregates over ds.listItems(); MemoryStore returns the whole catalog.
+// A production Oracle build would push the histogram down into SQL.
+
+type EventKind = 'VENDOR_PROMO' | 'REPRICE' | 'CLEARANCE';
+function classify(pc: PriceChange): EventKind {
+  if (pc.fundedByVendor) return 'VENDOR_PROMO';
+  if (pc.changeType === 'MARKDOWN_PCT' || pc.changeType === 'MARKDOWN_AMT') return 'CLEARANCE';
+  return 'REPRICE';
+}
+const round2 = (n: number) => Math.round(n * 100) / 100;
+const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+
+// ---------------------------------------------------------------------------
+// Sell-through model (SIMULATED).
+//
+// There is no POS/inventory feed in this POC, so we synthesize units
+// received/sold per SKU per week *deterministically* — the same SKU always
+// produces the same numbers, so the matrix never flickers between refreshes
+// and is safe to reason about. A production build replaces `stRate()` /
+// `stReceived()` with a join to the real sales + receipts feed; everything
+// downstream (the aggregation and the two matrices) stays identical.
+//
+// Sell-through % = units sold ÷ units received over the period. Because both
+// the numerator and denominator scale with store count, the *rate* is
+// independent of scope size — what makes one scope differ from another is its
+// item mix and its effective price points (cheaper items move faster).
+// ---------------------------------------------------------------------------
+const ST_WEEKS = 6;
+
+// FNV-1a style hash of two ints -> stable float in [0,1).
+function hash01(a: number, b: number): number {
+  let h = 2166136261 >>> 0;
+  h = Math.imul(h ^ (a & 0xffff), 16777619) >>> 0;
+  h = Math.imul(h ^ ((a >>> 16) & 0xffff), 16777619) >>> 0;
+  h = Math.imul(h ^ (b & 0xffff), 16777619) >>> 0;
+  h = Math.imul(h ^ ((b >>> 16) & 0xffff), 16777619) >>> 0;
+  return (h >>> 0) / 4294967296;
+}
+// Per-SKU baseline sell-through propensity (0.45–0.90) and receipt weight (40–200).
+const stPropensity = (sku: number) => 0.45 + hash01(sku, 7) * 0.45;
+const stReceived = (sku: number) => 40 + Math.floor(hash01(sku, 13) * 160);
+// Cheaper price points move faster (1.15 at $0, ~0.55 floor).
+const stPriceFactor = (price: number) => clamp(1.15 - price * 0.05, 0.55, 1.15);
+// Steady-state rate ignoring weekly noise (used for the price-band matrix).
+const stSteady = (sku: number, price: number) => clamp(stPropensity(sku) * stPriceFactor(price), 0.05, 0.985);
+// Weekly rate = steady ± seasonal noise (±0.11) + a mild per-SKU trend across the window.
+function stRate(sku: number, price: number, w: number): number {
+  const noise = (hash01(sku, 100 + w) - 0.5) * 0.22;
+  const trend = (hash01(sku, 3) - 0.5) * 0.04 * (w - (ST_WEEKS - 1) / 2);
+  return clamp(stPropensity(sku) * stPriceFactor(price) * (1 + noise + trend), 0.05, 0.985);
+}
+
+// Price bands for the category × band matrix (FD-style price points).
+const ST_BANDS: { label: string; test: (p: number) => boolean }[] = [
+  { label: '≤$1', test: (p) => p <= 1.0 },
+  { label: '$1.25', test: (p) => p > 1.0 && p <= 1.25 },
+  { label: '$1.50', test: (p) => p > 1.25 && p <= 1.5 },
+  { label: '$2–3', test: (p) => p > 1.5 && p <= 3.0 },
+  { label: '$4–5', test: (p) => p > 3.0 && p <= 5.0 },
+  { label: '$6+', test: (p) => p > 5.0 },
+];
+const stBandIndex = (p: number) => { const i = ST_BANDS.findIndex((b) => b.test(p)); return i < 0 ? ST_BANDS.length - 1 : i; };
+
+// Week-ending labels (MM/DD), oldest → newest, counting back from today.
+function stWeekLabels(): string[] {
+  const out: string[] = [];
+  const now = new Date();
+  for (let w = 0; w < ST_WEEKS; w++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - (ST_WEEKS - 1 - w) * 7);
+    out.push(`${d.getMonth() + 1}/${d.getDate()}`);
+  }
+  return out;
+}
+
+export async function storeViewRoutes(app: FastifyInstance, ds: DataStore) {
+  // Distinct regions (for the Region picker) with store counts.
+  app.get('/store-view/regions', async () => {
+    const stores = await ds.listStores();
+    const counts = new Map<string, number>();
+    for (const s of stores) { const r = s.regionName ?? 'Other'; counts.set(r, (counts.get(r) ?? 0) + 1); }
+    return { regions: [...counts.entries()].map(([region, storeCount]) => ({ region, storeCount })).sort((a, b) => b.storeCount - a.storeCount) };
+  });
+
+  app.get('/store-view', async (req, reply) => {
+    const q = req.query as any;
+    const kind = String(q?.kind ?? '').toUpperCase();
+    if (!['STORE', 'REGION', 'ZONE', 'DEPT'].includes(kind)) return reply.code(400).send({ error: 'bad_request', message: 'kind must be STORE|REGION|ZONE|DEPT' });
+
+    const [items, stores, depts, allPcs] = await Promise.all([
+      ds.listItems(), ds.listStores(), ds.listDepts(), ds.listPriceChanges(),
+    ]);
+    const deptName = new Map(depts.map((d) => [d.deptId, d.deptName]));
+
+    // ---- resolve the scope to a set of stores + an optional dept filter ----
+    let storeIds: number[] = [];
+    let deptFilter: number | null = null;
+    let label = '';
+    if (kind === 'STORE') {
+      const id = Number(q.storeId);
+      const st = stores.find((s) => s.storeId === id);
+      if (!st) return reply.code(404).send({ error: 'not_found', message: 'store not found' });
+      storeIds = [id]; label = `Store ${id} — ${st.name}${st.city ? ` (${st.city}, ${st.state})` : ''}`;
+    } else if (kind === 'REGION') {
+      const region = String(q.region ?? '');
+      storeIds = stores.filter((s) => (s.regionName ?? 'Other') === region).map((s) => s.storeId);
+      label = `Region — ${region}`;
+    } else if (kind === 'ZONE') {
+      const zoneGroupId = Number(q.zoneGroupId); const zoneId = Number(q.zoneId);
+      storeIds = await ds.resolveStores({ mode: 'ZONE', zoneGroupId, zoneId });
+      label = `Zone ${zoneId} (group ${zoneGroupId})`;
+    } else { // DEPT
+      deptFilter = Number(q.deptId);
+      storeIds = stores.map((s) => s.storeId); // a category spans all stores
+      label = `Department ${deptFilter} — ${deptName.get(deptFilter) ?? ''}`;
+    }
+    const storeSet = new Set(storeIds);
+
+    // ---- active (PROMOTED) price changes that touch this scope ----
+    const activePcs = allPcs
+      .filter((pc) => pc.status === 'PROMOTED' && pc.resolvedStoreIds.some((s) => storeSet.has(s)))
+      .sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate)); // last wins
+    const pcBySku = new Map<number, PriceChange>();
+    for (const pc of activePcs) for (const sku of pc.resolvedSkus) pcBySku.set(sku, pc);
+
+    const effectivePrice = (sku: number, base: number | null | undefined): number | null => {
+      const pc = pcBySku.get(sku);
+      if (!pc) return base ?? null;
+      return pcPriceForSku(pc, sku, base) ?? base ?? null;
+    };
+
+    // ---- item set in scope (dept filter if a Department was selected) ----
+    const scopedItems = deptFilter != null ? items.filter((i) => i.deptId === deptFilter) : items;
+
+    // ---- price points by category (department) ----
+    type Cat = { deptId: number; deptName: string; itemCount: number; sum: number; min: number; max: number; promoCount: number; hist: Map<number, number> };
+    const cats = new Map<number, Cat>();
+    let pricedTotal = 0;
+    for (const it of scopedItems) {
+      const dep = it.deptId ?? -1;
+      const eff = effectivePrice(it.sku, it.currentRetail);
+      let c = cats.get(dep);
+      if (!c) { c = { deptId: dep, deptName: deptName.get(dep) ?? `Dept ${dep}`, itemCount: 0, sum: 0, min: Infinity, max: -Infinity, promoCount: 0, hist: new Map() }; cats.set(dep, c); }
+      c.itemCount++;
+      if (it.promoLabel) c.promoCount++;
+      if (eff != null) {
+        const p = round2(eff);
+        c.sum += p; c.min = Math.min(c.min, p); c.max = Math.max(c.max, p);
+        c.hist.set(p, (c.hist.get(p) ?? 0) + 1);
+        pricedTotal++;
+      }
+    }
+    const categories = [...cats.values()]
+      .sort((a, b) => b.itemCount - a.itemCount)
+      .slice(0, 40)
+      .map((c) => ({
+        deptId: c.deptId, deptName: c.deptName, itemCount: c.itemCount, promoCount: c.promoCount,
+        avgRetail: c.itemCount ? round2(c.sum / Math.max(1, [...c.hist.values()].reduce((a, b) => a + b, 0))) : null,
+        minRetail: isFinite(c.min) ? c.min : null, maxRetail: isFinite(c.max) ? c.max : null,
+        pricePoints: [...c.hist.entries()].map(([price, count]) => ({ price, count })).sort((a, b) => b.count - a.count).slice(0, 8),
+      }));
+
+    // overall price-point histogram across the whole scope (top tiers)
+    const overall = new Map<number, number>();
+    for (const c of cats.values()) for (const [p, n] of c.hist) overall.set(p, (overall.get(p) ?? 0) + n);
+    const topPricePoints = [...overall.entries()].map(([price, count]) => ({ price, count })).sort((a, b) => b.count - a.count).slice(0, 12);
+
+    // ---- promotions running (web weekly-ad promos in scope) ----
+    const promoItems = scopedItems.filter((i) => i.promoLabel);
+    const webPromotions = promoItems.slice(0, 250).map((i) => ({
+      sku: i.sku, description: i.description, deptName: deptName.get(i.deptId ?? -1) ?? '',
+      currentRetail: i.currentRetail ?? null, promoPrice: i.promoPrice ?? null, promoLabel: i.promoLabel ?? null,
+    }));
+
+    // ---- active price-change events (promotions + clearances) in scope ----
+    const priceEvents = activePcs
+      .filter((pc) => deptFilter == null || pc.resolvedSkus.some((sku) => items.find((i) => i.sku === sku)?.deptId === deptFilter))
+      .map((pc) => ({
+        pcId: pc.pcId, pcName: pc.pcName, kind: classify(pc), changeType: pc.changeType, amount: pc.amount,
+        effectiveDate: pc.effectiveDate, fundedByVendor: pc.fundedByVendor,
+        skuCount: pc.resolvedSkus.length, storesInScope: pc.resolvedStoreIds.filter((s) => storeSet.has(s)).length,
+      }));
+
+    // ---- sell-through matrices (SIMULATED, deterministic) ----------------
+    // Accumulate units sold/received per department across (a) the recent-week
+    // window and (b) the price bands, then collapse to sell-through rates.
+    const weekSold = new Map<number, number[]>();   // dept -> [units sold per week]
+    const weekRecv = new Map<number, number[]>();   // dept -> [units received per week]
+    const bandSold = new Map<number, number[]>();   // dept -> [units sold per band]
+    const bandRecv = new Map<number, number[]>();   // dept -> [units received per band]
+    const ovSold = new Array(ST_WEEKS).fill(0);     // scope-wide sold per week
+    const ovRecv = new Array(ST_WEEKS).fill(0);     // scope-wide received per week
+    const ensure = (m: Map<number, number[]>, k: number, len: number) => {
+      let v = m.get(k); if (!v) { v = new Array(len).fill(0); m.set(k, v); } return v;
+    };
+    for (const it of scopedItems) {
+      const eff = effectivePrice(it.sku, it.currentRetail);
+      if (eff == null) continue;
+      const dep = it.deptId ?? -1;
+      const recv = stReceived(it.sku);
+      const ws = ensure(weekSold, dep, ST_WEEKS); const wr = ensure(weekRecv, dep, ST_WEEKS);
+      for (let w = 0; w < ST_WEEKS; w++) { const sold = recv * stRate(it.sku, eff, w); ws[w] = (ws[w] ?? 0) + sold; wr[w] = (wr[w] ?? 0) + recv; ovSold[w] += sold; ovRecv[w] += recv; }
+      const bi = stBandIndex(eff);
+      const bs = ensure(bandSold, dep, ST_BANDS.length); const br = ensure(bandRecv, dep, ST_BANDS.length);
+      const sold = recv * stSteady(it.sku, eff); bs[bi] += sold; br[bi] += recv;
+    }
+    // Rows follow the same top-categories ordering used above (cap at 12 for readability).
+    const stRows = categories.slice(0, 12).map((c) => c.deptId);
+    const pct = (sold: number, recv: number): number | null => (recv > 0 ? round2((sold / recv) * 100) : null);
+    const byWeek = {
+      columns: stWeekLabels(),
+      rows: stRows.map((dep) => {
+        const ws = weekSold.get(dep) ?? []; const wr = weekRecv.get(dep) ?? [];
+        const cells = Array.from({ length: ST_WEEKS }, (_, w) => pct(ws[w] ?? 0, wr[w] ?? 0));
+        const tot = cells.reduce<{ s: number; r: number }>((a, _v, w) => ({ s: a.s + (ws[w] ?? 0), r: a.r + (wr[w] ?? 0) }), { s: 0, r: 0 });
+        return { deptId: dep, deptName: deptName.get(dep) ?? `Dept ${dep}`, cells, avg: pct(tot.s, tot.r) };
+      }),
+    };
+    const byBand = {
+      columns: ST_BANDS.map((b) => b.label),
+      rows: stRows.map((dep) => {
+        const bs = bandSold.get(dep) ?? []; const br = bandRecv.get(dep) ?? [];
+        const cells = ST_BANDS.map((_b, i) => pct(bs[i] ?? 0, br[i] ?? 0));
+        const tot = ST_BANDS.reduce<{ s: number; r: number }>((a, _b, i) => ({ s: a.s + (bs[i] ?? 0), r: a.r + (br[i] ?? 0) }), { s: 0, r: 0 });
+        return { deptId: dep, deptName: deptName.get(dep) ?? `Dept ${dep}`, cells, avg: pct(tot.s, tot.r) };
+      }),
+    };
+    const overallByWeek = stWeekLabels().map((week, w) => ({ week, rate: pct(ovSold[w], ovRecv[w]) }));
+    const overallRate = pct(ovSold.reduce((a, b) => a + b, 0), ovRecv.reduce((a, b) => a + b, 0));
+
+    return {
+      scope: { kind, label, storeCount: storeIds.length, deptId: deptFilter },
+      itemCount: scopedItems.length, pricedCount: pricedTotal,
+      topPricePoints,
+      categories,
+      webPromotions, webPromotionsTotal: promoItems.length,
+      promotions: priceEvents.filter((e) => e.kind !== 'CLEARANCE'),
+      clearances: priceEvents.filter((e) => e.kind === 'CLEARANCE'),
+      sellThrough: {
+        simulated: true,
+        note: 'Simulated POS sell-through (units sold ÷ units received), generated deterministically for this POC. Wire to the real sales + receipts feed in production.',
+        overallRate,
+        overallByWeek,
+        byWeek,
+        byBand,
+      },
+    };
+  });
+}

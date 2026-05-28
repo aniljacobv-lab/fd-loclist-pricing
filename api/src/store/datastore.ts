@@ -1,0 +1,117 @@
+import type {
+  Item, Store, ZoneGroup, Zone, Dept, MerchClass, Subclass, Division, Group,
+  Vendor, LocationList, SkuList, PriceChange, NewPriceChangeInput, PCStatus, Page,
+  ItemSelector, LocationSelector, CalendarActivity, NewCalendarActivity, CalendarScope, PcJob, JobType,
+  RezoneInput, RezonePreview,
+  Role,
+} from '../types.js';
+
+export interface DataStore {
+  init(): Promise<void>;
+  shutdown(): Promise<void>;
+
+  // Reference (read-only)
+  listItems(q?: { search?: string }): Promise<Item[]>;
+  getItem(sku: number): Promise<Item | null>;
+  listStores(): Promise<Store[]>;
+  getStore(storeId: number): Promise<Store | null>;
+  listZoneGroups(): Promise<ZoneGroup[]>;
+  listZones(zoneGroupId?: number): Promise<Zone[]>;
+  listVendors(): Promise<Vendor[]>;
+  listDivisions(): Promise<Division[]>;
+  listGroups(division?: number): Promise<Group[]>;
+  // Paged + searchable (for FD-volume lists in the UI)
+  searchStores(q: { search?: string; page?: number; pageSize?: number }): Promise<Page<Store>>;
+  searchItems(q: { search?: string; page?: number; pageSize?: number }): Promise<Page<Item>>;
+  searchZones(q: { zoneGroupId: number; search?: string; page?: number; pageSize?: number }): Promise<Page<Zone>>;
+  listDepts(groupNo?: number): Promise<Dept[]>;
+  listClasses(deptId?: number): Promise<MerchClass[]>;
+  listSubclasses(deptId?: number, classId?: number): Promise<Subclass[]>;
+
+  // Selector resolution
+  resolveItems(sel: ItemSelector): Promise<number[]>;
+  resolveStores(sel: LocationSelector): Promise<number[]>;
+
+  // Location lists
+  listLocationLists(): Promise<LocationList[]>;
+  getLocationList(locListId: number): Promise<LocationList | null>;
+  createLocationList(input: { name: string; description?: string | null; storeIds: number[]; createdBy: string }): Promise<LocationList>;
+  updateLocationList(locListId: number, patch: { name?: string; description?: string | null; storeIds?: number[] }): Promise<LocationList | null>;
+  deleteLocationList(locListId: number): Promise<boolean>;
+
+  // SKU lists
+  listSkuLists(): Promise<SkuList[]>;
+  getSkuList(skuListId: number): Promise<SkuList | null>;
+  createSkuList(input: { name: string; description?: string | null; skus: number[]; createdBy: string }): Promise<SkuList>;
+  updateSkuList(skuListId: number, patch: { name?: string; description?: string | null; skus?: number[] }): Promise<SkuList | null>;
+  deleteSkuList(skuListId: number): Promise<boolean>;
+
+  // Price changes
+  listPriceChanges(filter?: { status?: PCStatus }): Promise<PriceChange[]>;
+  getPriceChange(pcId: number): Promise<PriceChange | null>;
+  createPriceChange(input: NewPriceChangeInput): Promise<PriceChange>;
+  updatePriceChangeStatus(pcId: number, status: PCStatus): Promise<PriceChange | null>;
+
+  // Execution (set-based resolve + promote + async jobs)
+  resolvePriceChange(pcId: number): Promise<{ skuCount: number; storeCount: number } | null>;
+  // Rezone: move store(s) to a new zone and inherit that zone's prices
+  previewRezone(input: RezoneInput): Promise<RezonePreview>;
+  createRezone(input: RezoneInput): Promise<{ priceChange: PriceChange; preview: RezonePreview }>;
+  promotePriceChange(pcId: number): Promise<PriceChange | null>;
+  submitJob(pcId: number, jobType: JobType): Promise<PcJob>;
+  getJob(jobId: number): Promise<PcJob | null>;
+  listJobs(pcId?: number): Promise<PcJob[]>;
+
+  // Calendar
+  listCalendarActivities(range?: { from?: string; to?: string }, scope?: CalendarScope): Promise<CalendarActivity[]>;
+  createCalendarActivity(input: NewCalendarActivity): Promise<CalendarActivity>;
+  deleteCalendarActivity(activityId: number): Promise<boolean>;
+  replaceAiActivities(range: { from?: string; to?: string }, scope: CalendarScope, items: NewCalendarActivity[]): Promise<CalendarActivity[]>;
+
+  // Approval workflow (multi-tier, risk-routed)
+  submitForApproval(pcId: number, actor: string, requiredTier: number): Promise<PriceChange | null>;
+  approvePc(pcId: number, actor: string, role: Role, tier: number, comment: string | null): Promise<PriceChange | null>;
+  rejectPc(pcId: number, actor: string, role: Role, comment: string | null): Promise<PriceChange | null>;
+  commentOnPc(pcId: number, actor: string, role: Role, comment: string): Promise<PriceChange | null>;
+}
+
+// ----- shared price math (used by routes /pricing/preview) -----
+export function computeNewRetail(
+  currentRetail: number | null | undefined,
+  changeType: 'SET_PRICE' | 'MARKDOWN_PCT' | 'MARKDOWN_AMT',
+  amount: number,
+  endsIn: number | null
+): number | null {
+  if (changeType === 'SET_PRICE') return applyEnds(amount, endsIn);
+  if (currentRetail == null) return null;
+  if (changeType === 'MARKDOWN_PCT') return applyEnds(currentRetail * (1 - amount / 100), endsIn);
+  return applyEnds(currentRetail - amount, endsIn); // MARKDOWN_AMT
+}
+function applyEnds(price: number, endsIn: number | null): number {
+  const p = Math.max(0, price);
+  if (endsIn == null) return Math.round(p * 100) / 100;
+  // round down to the nearest whole dollar then add the ending cents
+  const whole = Math.floor(p);
+  const candidate = whole + endsIn;
+  // if that overshoots (e.g. p=4.20, endsIn=.99 -> 4.99 > 4.20 ok; p=4.00 -> 3.99? keep <= p when markdown)
+  return candidate <= p ? Math.round(candidate * 100) / 100 : Math.round(Math.max(0, whole - 1 + endsIn) * 100) / 100;
+}
+export function marginPct(newRetail: number | null, cost: number | null | undefined): number | null {
+  if (newRetail == null || cost == null || newRetail <= 0) return null;
+  return Math.round(((newRetail - cost) / newRetail) * 1000) / 10; // one decimal
+}
+
+// Effective new retail for a given SKU under a price change — handles the
+// per-SKU ZONE_INHERIT map as well as the rule-based change types.
+export function pcPriceForSku(
+  pc: { changeType: 'SET_PRICE'|'MARKDOWN_PCT'|'MARKDOWN_AMT'|'ZONE_INHERIT'; amount: number; endsIn: number | null; priceMap?: { sku: number; newRetail: number }[] | null },
+  sku: number,
+  base: number | null | undefined
+): number | null {
+  if (pc.changeType === 'ZONE_INHERIT') {
+    const e = pc.priceMap?.find((m) => m.sku === sku);
+    return e ? e.newRetail : (base ?? null);
+  }
+  return computeNewRetail(base, pc.changeType, pc.amount, pc.endsIn);
+}
+

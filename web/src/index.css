@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* AG Grid stylesheets are imported from main.tsx (JS) so Vite bundles them
+   reliably — CSS @import after @tailwind directives gets dropped. */
+
+:root {
+  --ag-font-family: 'Inter', system-ui, sans-serif;
+  --ag-font-size: 13px;
+  --ag-foreground-color: #1d2939;
+  --ag-header-background-color: #fafbfc;
+  --ag-header-foreground-color: #667085;
+  --ag-header-cell-hover-background-color: #f3f4f6;
+  --ag-border-color: #eaecf0;
+  --ag-row-border-color: #f1f3f5;
+  --ag-row-hover-color: #f9fafb;
+  --ag-selected-row-background-color: #fdecec;
+  --ag-cell-horizontal-padding: 16px;
+  --ag-header-height: 42px;
+  --ag-row-height: 46px;
+  --ag-active-color: #D8232A;
+  --ag-wrapper-border-radius: 12px;
+  --ag-borders: solid 1px;
+}
+
+html, body, #root { height: 100%; }
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  color: #1d2939;
+  background: #f7f8fa;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb {
+  background: #d0d5dd; border-radius: 8px;
+  border: 2px solid transparent; background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: #98a2b3; background-clip: content-box; }
+
+@layer components {
+  .fd-card {
+    @apply rounded-xl border border-slate-200 bg-white;
+    box-shadow: 0 1px 2px rgba(16,24,40,0.04), 0 1px 3px rgba(16,24,40,0.05);
+  }
+  .fd-label { @apply mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-400; }
+  .fd-section-title { @apply text-[13px] font-semibold text-slate-800; }
+  .fd-input {
+    @apply h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none transition;
+  }
+  .fd-input:focus { border-color: #D8232A; box-shadow: 0 0 0 3px rgba(216,35,42,0.15); }
+  .fd-btn {
+    @apply inline-flex h-9 items-center justify-center gap-1.5 rounded-lg px-4 text-sm font-medium transition
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .fd-btn-primary { @apply text-white; background: #D8232A; box-shadow: 0 1px 2px rgba(16,24,40,0.08); }
+  .fd-btn-primary:hover { background: #b51d23; }
+  .fd-btn-ghost { @apply border border-slate-200 bg-white text-slate-700; }
+  .fd-btn-ghost:hover { @apply bg-slate-50; }
+  .fd-seg { @apply inline-flex gap-1 rounded-lg bg-slate-100 p-1; }
+  .fd-seg-item { @apply flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium text-slate-500 transition; }
+  .fd-seg-item:hover { @apply text-slate-700; }
+  .fd-seg-item-active { @apply bg-white text-slate-900; box-shadow: 0 1px 2px rgba(16,24,40,0.06); }
+  .fd-pill { @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium; }
+}

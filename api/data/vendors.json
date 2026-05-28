@@ -1,0 +1,17 @@
+[
+  { "vendorId": 1, "vendorName": "Frito-Lay", "isDSD": true },
+  { "vendorId": 2, "vendorName": "Coca-Cola", "isDSD": true },
+  { "vendorId": 3, "vendorName": "PepsiCo Beverages", "isDSD": true },
+  { "vendorId": 4, "vendorName": "Keurig Dr Pepper", "isDSD": true },
+  { "vendorId": 5, "vendorName": "Bimbo Bakeries", "isDSD": true },
+  { "vendorId": 6, "vendorName": "Flowers Foods", "isDSD": true },
+  { "vendorId": 7, "vendorName": "Mondelez / Nabisco", "isDSD": true },
+  { "vendorId": 8, "vendorName": "The Hershey Company", "isDSD": true },
+  { "vendorId": 9, "vendorName": "Mars Wrigley", "isDSD": true },
+  { "vendorId": 10, "vendorName": "Red Bull", "isDSD": true },
+  { "vendorId": 11, "vendorName": "Monster Energy", "isDSD": true },
+  { "vendorId": 12, "vendorName": "Utz Brands", "isDSD": true },
+  { "vendorId": 90, "vendorName": "McLane (Warehouse)", "isDSD": false },
+  { "vendorId": 91, "vendorName": "FD Private Label", "isDSD": false },
+  { "vendorId": 92, "vendorName": "General Merch Import", "isDSD": false }
+]

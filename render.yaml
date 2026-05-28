@@ -1,0 +1,23 @@
+# Render blueprint — deploys the FD Pricing Workbench as a single Web Service.
+# Connect this repo at https://dashboard.render.com/select-repo and Render picks
+# up this file automatically. Subsequent `git push` triggers an auto-redeploy.
+services:
+  - type: web
+    name: fd-pricing-workbench
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: |
+      cd web && npm ci && npm run build && cd ../api && npm ci && npm run build
+    startCommand: cd api && node dist/server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: HOST
+        value: "0.0.0.0"
+      - key: DATASTORE
+        value: memory
+      # Set this in the Render dashboard (kept out of git):
+      - key: ANTHROPIC_API_KEY
+        sync: false

@@ -1,0 +1,585 @@
+import oracledb from 'oracledb';
+import type { DataStore } from './datastore.js';
+import { pcPriceForSku } from './datastore.js';
+import type {
+  Item, Store, ZoneGroup, Zone, Dept, MerchClass, Subclass, Vendor, Page, Division, Group,
+  LocationList, SkuList, PriceChange, NewPriceChangeInput, PCStatus,
+  ItemSelector, LocationSelector, CalendarActivity, NewCalendarActivity, CalendarScope, PcJob, JobType,
+  RezoneInput, RezonePreview, RezonePreviewLine, Role,
+} from '../types.js';
+import { config } from '../config.js';
+
+function endsInMatch(retail: number | null | undefined, cents: number): boolean {
+  if (retail == null) return false;
+  const frac = Math.round((retail - Math.floor(retail)) * 100) / 100;
+  return Math.abs(frac - cents) < 0.005;
+}
+function isoMinusDays(iso: string, days: number): string {
+  const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - days); return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Oracle 12c implementation (node-oracledb Thin mode). Column/table names follow
+ * standard RMS 13.x/14.x; adjust SQL strings if the local install differs.
+ *
+ * FD-VOLUME STRATEGY (see db/packages + docs/scalability.md):
+ *   - Heavy work is set-based in PL/SQL. createPriceChange stores the JSON selector
+ *     and calls PKG_FDPM_PRICING.resolve_price_change (GTT-staged, direct-path).
+ *   - Promotion streams the SKU x STORE cross product to RMS staging in parallel
+ *     DBMS_PARALLEL_EXECUTE chunks (see promotePriceChange -> PKG promote).
+ *   - The app pulls at most RESOLVED_SAMPLE_CAP resolved ids per PC for display;
+ *     the authoritative resolved set lives in the partitioned snapshot tables.
+ */
+export class OracleStore implements DataStore {
+  private pool: oracledb.Pool | null = null;
+
+  async init(): Promise<void> {
+    oracledb.fetchAsString = [oracledb.CLOB];
+    oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
+    this.pool = await oracledb.createPool({
+      user: config.oracle.user, password: config.oracle.password, connectString: config.oracle.connectString,
+      poolMin: config.oracle.poolMin, poolMax: config.oracle.poolMax, poolIncrement: 1,
+    });
+  }
+  async shutdown(): Promise<void> { if (this.pool) { await this.pool.close(10); this.pool = null; } }
+  private async withConn<T>(fn: (c: oracledb.Connection) => Promise<T>): Promise<T> {
+    if (!this.pool) throw new Error('OracleStore not initialised');
+    const conn = await this.pool.getConnection();
+    try { return await fn(conn); } finally { await conn.close(); }
+  }
+  private rms(t: string): string { return `${config.oracle.rmsSchema}.${t}`; }
+  private app(t: string): string { return `${config.oracle.appPrefix}${t}`; }
+
+  async listItems({ search }: { search?: string } = {}): Promise<Item[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(
+        `SELECT im.ITEM AS SKU, im.ITEM_DESC AS DESCRIPTION, im.DEPT AS DEPT_ID, im.CLASS AS CLASS_ID, im.SUBCLASS AS SUBCLASS_ID,
+                isup.SUPPLIER AS VENDOR_ID, s.SUP_NAME AS VENDOR_NAME
+         FROM ${this.rms('ITEM_MASTER')} im
+         LEFT JOIN ${this.rms('ITEM_SUPPLIER')} isup ON isup.ITEM = im.ITEM AND isup.PRIMARY_SUPP_IND = 'Y'
+         LEFT JOIN ${this.rms('SUPS')} s ON s.SUPPLIER = isup.SUPPLIER
+         WHERE im.STATUS='A'
+           AND ( :search IS NULL OR REGEXP_LIKE(TO_CHAR(im.ITEM), :search) OR UPPER(im.ITEM_DESC) LIKE '%'||UPPER(:search)||'%' )
+         ORDER BY im.ITEM FETCH FIRST 500 ROWS ONLY`,
+        { search: search ?? null });
+      return (r.rows ?? []).map((row: any) => ({
+        sku: row.SKU, description: row.DESCRIPTION, deptId: row.DEPT_ID, classId: row.CLASS_ID, subclassId: row.SUBCLASS_ID,
+        vendorId: row.VENDOR_ID, vendorName: row.VENDOR_NAME, isDSD: false, cost: null, currentRetail: null,
+      }));
+    });
+  }
+  async getItem(sku: number): Promise<Item | null> { return (await this.listItems({ search: String(sku) })).find((i) => i.sku === sku) ?? null; }
+
+  async listStores(): Promise<Store[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(
+        `SELECT s.STORE AS STORE_ID, s.STORE_NAME AS NAME, s.DISTRICT AS DISTRICT_ID, d.DISTRICT_NAME AS DISTRICT_NAME,
+                s.REGION AS REGION_ID, r.REGION_NAME AS REGION_NAME, s.STORE_FORMAT AS FORMAT_ID, sf.STORE_FORMAT_NAME AS FORMAT_NAME, s.STATE AS STATE
+         FROM ${this.rms('STORE')} s
+         LEFT JOIN ${this.rms('DISTRICT')} d ON d.DISTRICT=s.DISTRICT
+         LEFT JOIN ${this.rms('REGION')} r ON r.REGION=s.REGION
+         LEFT JOIN ${this.rms('STORE_FORMAT')} sf ON sf.STORE_FORMAT=s.STORE_FORMAT
+         WHERE s.STORE_CLOSE_DATE IS NULL OR s.STORE_CLOSE_DATE>SYSDATE ORDER BY s.STORE`);
+      return (r.rows ?? []).map((row: any) => ({
+        storeId: row.STORE_ID, name: row.NAME, districtId: row.DISTRICT_ID, districtName: row.DISTRICT_NAME,
+        regionId: row.REGION_ID, regionName: row.REGION_NAME, formatId: row.FORMAT_ID, formatName: row.FORMAT_NAME, state: row.STATE, velocity: null,
+      }));
+    });
+  }
+  async getStore(storeId: number): Promise<Store | null> { return (await this.listStores()).find((s) => s.storeId === storeId) ?? null; }
+
+  async listVendors(): Promise<Vendor[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT SUPPLIER AS VENDOR_ID, SUP_NAME AS VENDOR_NAME FROM ${this.rms('SUPS')} ORDER BY SUP_NAME`);
+      // RMS has no standard DSD flag column; treat all as non-DSD unless a custom column exists.
+      return (r.rows ?? []).map((row: any) => ({ vendorId: row.VENDOR_ID, vendorName: row.VENDOR_NAME, isDSD: false }));
+    });
+  }
+
+  async listZoneGroups(): Promise<ZoneGroup[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT zg.ZONE_GROUP_ID, zg.ZONE_GROUP_NAME FROM ${this.rms('RPM_ZONE_GROUP')} zg ORDER BY zg.ZONE_GROUP_ID`);
+      return (r.rows ?? []).map((row: any) => ({ zoneGroupId: row.ZONE_GROUP_ID, zoneGroupName: row.ZONE_GROUP_NAME }));
+    });
+  }
+  async listZones(zoneGroupId?: number): Promise<Zone[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(
+        `SELECT z.ZONE_ID, z.ZONE_GROUP_ID, z.ZONE_NAME, zl.LOCATION AS STORE_ID
+         FROM ${this.rms('RPM_ZONE')} z LEFT JOIN ${this.rms('RPM_ZONE_LOCATION')} zl ON zl.ZONE_ID=z.ZONE_ID
+         WHERE :zgid IS NULL OR z.ZONE_GROUP_ID=:zgid ORDER BY z.ZONE_GROUP_ID, z.ZONE_ID`, { zgid: zoneGroupId ?? null });
+      const map = new Map<number, Zone>();
+      for (const row of (r.rows ?? []) as any[]) {
+        let z = map.get(row.ZONE_ID);
+        if (!z) { z = { zoneId: row.ZONE_ID, zoneGroupId: row.ZONE_GROUP_ID, zoneName: row.ZONE_NAME, storeCount: 0, storeIds: [] }; map.set(row.ZONE_ID, z); }
+        if (row.STORE_ID != null) z.storeIds!.push(row.STORE_ID);
+      }
+      for (const z of map.values()) z.storeCount = z.storeIds!.length;
+      return [...map.values()];
+    });
+  }
+
+  async listDivisions(): Promise<Division[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT DIVISION, DIV_NAME FROM ${this.rms('DIVISION')} ORDER BY DIVISION`);
+      return (r.rows ?? []).map((row: any) => ({ division: row.DIVISION, name: row.DIV_NAME }));
+    });
+  }
+  async listGroups(division?: number): Promise<Group[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT GROUP_NO, GROUP_NAME, DIVISION FROM ${this.rms('GROUPS')} WHERE :d IS NULL OR DIVISION=:d ORDER BY GROUP_NO`, { d: division ?? null });
+      return (r.rows ?? []).map((row: any) => ({ groupNo: row.GROUP_NO, name: row.GROUP_NAME, division: row.DIVISION }));
+    });
+  }
+  async listDepts(groupNo?: number): Promise<Dept[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT DEPT AS DEPT_ID, DEPT_NAME, GROUP_NO FROM ${this.rms('DEPS')} WHERE :g IS NULL OR GROUP_NO=:g ORDER BY DEPT`, { g: groupNo ?? null });
+      return (r.rows ?? []).map((row: any) => ({ deptId: row.DEPT_ID, deptName: row.DEPT_NAME, groupNo: row.GROUP_NO }));
+    });
+  }
+  async listClasses(deptId?: number): Promise<MerchClass[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT DEPT AS DEPT_ID, CLASS AS CLASS_ID, CLASS_NAME FROM ${this.rms('CLASS')} WHERE :d IS NULL OR DEPT=:d ORDER BY DEPT, CLASS`, { d: deptId ?? null });
+      return (r.rows ?? []).map((row: any) => ({ deptId: row.DEPT_ID, classId: row.CLASS_ID, className: row.CLASS_NAME }));
+    });
+  }
+  async listSubclasses(deptId?: number, classId?: number): Promise<Subclass[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT DEPT AS DEPT_ID, CLASS AS CLASS_ID, SUBCLASS AS SUBCLASS_ID, SUB_NAME AS SUBCLASS_NAME FROM ${this.rms('SUBCLASS')} WHERE (:d IS NULL OR DEPT=:d) AND (:c IS NULL OR CLASS=:c) ORDER BY DEPT, CLASS, SUBCLASS`, { d: deptId ?? null, c: classId ?? null });
+      return (r.rows ?? []).map((row: any) => ({ deptId: row.DEPT_ID, classId: row.CLASS_ID, subclassId: row.SUBCLASS_ID, subclassName: row.SUBCLASS_NAME }));
+    });
+  }
+
+  // ---- paged search (SQL-side OFFSET/FETCH for FD volume) ----
+  private pageParams(q: { page?: number; pageSize?: number }) {
+    const ps = Math.min(Math.max(1, q.pageSize ?? config.app.pagination.defaultPageSize), config.app.pagination.maxPageSize);
+    const p = Math.max(1, q.page ?? 1);
+    return { ps, p, off: (p - 1) * ps };
+  }
+  async searchStores(q: { search?: string; page?: number; pageSize?: number }): Promise<Page<Store>> {
+    const { ps, p, off } = this.pageParams(q);
+    const like = q.search ? `%${q.search.toUpperCase()}%` : null;
+    return this.withConn(async (c) => {
+      const where = `WHERE (s.STORE_CLOSE_DATE IS NULL OR s.STORE_CLOSE_DATE>SYSDATE) AND (:like IS NULL OR UPPER(s.STORE_NAME) LIKE :like OR TO_CHAR(s.STORE) LIKE :like OR UPPER(s.STORE_CITY) LIKE :like)`;
+      const cnt = await c.execute<any>(`SELECT COUNT(*) AS N FROM ${this.rms('STORE')} s ${where}`, { like });
+      const total = Number((cnt.rows![0] as any).N);
+      const r = await c.execute<any>(
+        `SELECT s.STORE AS STORE_ID, s.STORE_NAME AS NAME, s.STORE_CITY AS CITY, s.STATE AS STATE, s.STORE_CLASS AS STORE_CLASS, s.DISTRICT AS DISTRICT_ID, s.STORE_FORMAT AS FORMAT_ID
+         FROM ${this.rms('STORE')} s ${where} ORDER BY s.STORE OFFSET :off ROWS FETCH NEXT :ps ROWS ONLY`, { like, off, ps });
+      const region = config.app.regionByState; const fmt = config.app.formatNames;
+      const rows: Store[] = (r.rows ?? []).map((row: any) => ({
+        storeId: row.STORE_ID, name: row.NAME, city: row.CITY, state: row.STATE, storeClass: row.STORE_CLASS,
+        districtId: row.DISTRICT_ID, districtName: row.DISTRICT_ID != null ? `District ${row.DISTRICT_ID}` : null,
+        regionId: null, regionName: row.STATE ? (region[row.STATE] ?? 'Other') : null,
+        formatId: row.FORMAT_ID, formatName: row.FORMAT_ID != null ? (fmt[String(row.FORMAT_ID)] ?? `Format ${row.FORMAT_ID}`) : null, velocity: null,
+      }));
+      return { rows, total, page: p, pageSize: ps };
+    });
+  }
+  async searchItems(q: { search?: string; page?: number; pageSize?: number }): Promise<Page<Item>> {
+    const { ps, p, off } = this.pageParams(q);
+    const like = q.search ? `%${q.search.toUpperCase()}%` : null;
+    return this.withConn(async (c) => {
+      const where = `WHERE im.STATUS='A' AND (:like IS NULL OR UPPER(im.ITEM_DESC) LIKE :like OR TO_CHAR(im.ITEM) LIKE :like)`;
+      const cnt = await c.execute<any>(`SELECT COUNT(*) AS N FROM ${this.rms('ITEM_MASTER')} im ${where}`, { like });
+      const total = Number((cnt.rows![0] as any).N);
+      const r = await c.execute<any>(
+        `SELECT im.ITEM AS SKU, im.ITEM_DESC AS DESCRIPTION, im.DEPT AS DEPT_ID, im.CLASS AS CLASS_ID, im.SUBCLASS AS SUBCLASS_ID
+         FROM ${this.rms('ITEM_MASTER')} im ${where} ORDER BY im.ITEM OFFSET :off ROWS FETCH NEXT :ps ROWS ONLY`, { like, off, ps });
+      const rows: Item[] = (r.rows ?? []).map((row: any) => ({ sku: row.SKU, description: row.DESCRIPTION, deptId: row.DEPT_ID, classId: row.CLASS_ID, subclassId: row.SUBCLASS_ID, cost: null, currentRetail: null }));
+      return { rows, total, page: p, pageSize: ps };
+    });
+  }
+  async searchZones(q: { zoneGroupId: number; search?: string; page?: number; pageSize?: number }): Promise<Page<Zone>> {
+    const { ps, p, off } = this.pageParams(q);
+    const like = q.search ? `%${q.search.toUpperCase()}%` : null;
+    return this.withConn(async (c) => {
+      const where = `WHERE z.ZONE_GROUP_ID=:zg AND (:like IS NULL OR UPPER(z.ZONE_NAME) LIKE :like OR TO_CHAR(z.ZONE_ID) LIKE :like)`;
+      const cnt = await c.execute<any>(`SELECT COUNT(*) AS N FROM ${this.rms('RPM_ZONE')} z ${where}`, { zg: q.zoneGroupId, like });
+      const total = Number((cnt.rows![0] as any).N);
+      const r = await c.execute<any>(
+        `SELECT z.ZONE_ID, z.ZONE_GROUP_ID, z.ZONE_NAME, (SELECT COUNT(*) FROM ${this.rms('RPM_ZONE_LOCATION')} zl WHERE zl.ZONE_ID=z.ZONE_ID) AS STORE_COUNT
+         FROM ${this.rms('RPM_ZONE')} z ${where} ORDER BY z.ZONE_ID OFFSET :off ROWS FETCH NEXT :ps ROWS ONLY`, { zg: q.zoneGroupId, like, off, ps });
+      const rows: Zone[] = (r.rows ?? []).map((row: any) => ({ zoneId: row.ZONE_ID, zoneGroupId: row.ZONE_GROUP_ID, zoneName: row.ZONE_NAME, storeCount: Number(row.STORE_COUNT) }));
+      return { rows, total, page: p, pageSize: ps };
+    });
+  }
+
+  async resolveItems(sel: ItemSelector): Promise<number[]> {
+    // Multi-value predicate filters: OR within a filter (IN-list), AND across filters.
+    const list = (arr?: number[], single?: number | null): number[] => (arr?.length ? arr : (single != null ? [single] : []));
+    const depts = list(sel.deptIds, sel.deptId), classes = list(sel.classIds, sel.classId), subs = list(sel.subclassIds, sel.subclassId), vendors = list(sel.vendorIds, sel.vendorId);
+    const hasHierVendor = depts.length > 0 || classes.length > 0 || subs.length > 0 || vendors.length > 0;
+    // Values are zod-validated integers, so inlining them as an IN-list is safe.
+    const inInts = (col: string, arr: number[]) => (arr.length ? ` AND ${col} IN (${arr.map((n) => Number(n)).join(',')})` : '');
+    const vendorClause = vendors.length ? ` AND EXISTS (SELECT 1 FROM ${this.rms('ITEM_SUPPLIER')} isup WHERE isup.ITEM=im.ITEM AND isup.SUPPLIER IN (${vendors.map((n) => Number(n)).join(',')}))` : '';
+    const hierVendor = await this.withConn(async (c) => {
+      const r = await c.execute<any>(
+        `SELECT im.ITEM AS SKU FROM ${this.rms('ITEM_MASTER')} im WHERE im.STATUS='A'${inInts('im.DEPT', depts)}${inInts('im.CLASS', classes)}${inInts('im.SUBCLASS', subs)}${vendorClause}`);
+      return (r.rows ?? []).map((x: any) => x.SKU as number);
+    });
+
+    let candidates: number[];
+    if (sel.mode === 'SINGLE_SKU') {
+      candidates = sel.sku != null ? [sel.sku] : [];
+    } else if (sel.mode === 'SKU_LIST') {
+      if (sel.skuListId != null) { const l = await this.getSkuList(sel.skuListId); candidates = l ? [...l.skus] : []; }
+      else candidates = sel.skus?.length ? [...sel.skus] : [];
+    } else {
+      candidates = hierVendor; // ALL / HIERARCHY / PRICE_POINT / VENDOR → catalog (already hier/vendor-filtered)
+    }
+    if ((sel.mode === 'SINGLE_SKU' || sel.mode === 'SKU_LIST') && hasHierVendor) {
+      const allow = new Set(hierVendor);
+      candidates = candidates.filter((s) => allow.has(s));
+    }
+    const pps = sel.pricePointEndsInList?.length ? sel.pricePointEndsInList : (sel.pricePointEndsIn != null ? [sel.pricePointEndsIn] : []);
+    if (pps.length) {
+      const items = await this.listItems();
+      const retailBySku = new Map(items.map((i) => [i.sku, i.currentRetail]));
+      candidates = candidates.filter((s) => pps.some((p) => endsInMatch(retailBySku.get(s) ?? null, p)));
+    }
+    const except = new Set(sel.exceptSkus ?? []);
+    return candidates.filter((s) => !except.has(s));
+  }
+  async resolveStores(sel: LocationSelector): Promise<number[]> {
+    const set = new Set<number>();
+    if (sel.mode === 'LOCATION_LIST') {
+      const listIds = sel.locListIds?.length ? sel.locListIds : (sel.locListId != null ? [sel.locListId] : []);
+      for (const lid of listIds) { const l = await this.getLocationList(lid); if (l) for (const s of l.storeIds) set.add(s); }
+    } else if (sel.mode === 'ZONE') {
+      const zoneIds = sel.zoneIds?.length ? sel.zoneIds : (sel.zoneId != null ? [sel.zoneId] : []);
+      if (sel.zoneGroupId != null && zoneIds.length) {
+        const zs = await this.listZones(sel.zoneGroupId);
+        const want = new Set(zoneIds);
+        for (const z of zs) if (want.has(z.zoneId) && z.storeIds) for (const s of z.storeIds) set.add(s);
+      }
+    } else if (sel.mode === 'STORES') {
+      for (const s of (sel.storeIds ?? [])) set.add(s);
+    }
+    const except = new Set(sel.exceptStoreIds ?? []);
+    return [...set].filter((s) => !except.has(s));
+  }
+
+  async listLocationLists(): Promise<LocationList[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT l.LOC_LIST_ID, l.LOC_LIST_NAME, l.DESCRIPTION, l.CREATED_BY, l.CREATED_AT, ls.STORE_ID FROM ${this.app('LOC_LIST')} l LEFT JOIN ${this.app('LOC_LIST_STORE')} ls ON ls.LOC_LIST_ID=l.LOC_LIST_ID ORDER BY l.LOC_LIST_ID, ls.STORE_ID`);
+      const map = new Map<number, LocationList>();
+      for (const row of (r.rows ?? []) as any[]) {
+        let l = map.get(row.LOC_LIST_ID);
+        if (!l) { l = { locListId: row.LOC_LIST_ID, locListName: row.LOC_LIST_NAME, description: row.DESCRIPTION, createdBy: row.CREATED_BY, createdAt: (row.CREATED_AT as Date).toISOString(), storeIds: [] }; map.set(row.LOC_LIST_ID, l); }
+        if (row.STORE_ID != null) l.storeIds.push(row.STORE_ID);
+      }
+      return [...map.values()];
+    });
+  }
+  async getLocationList(id: number): Promise<LocationList | null> { return (await this.listLocationLists()).find((l) => l.locListId === id) ?? null; }
+  async createLocationList(input: { name: string; description?: string | null; storeIds: number[]; createdBy: string }): Promise<LocationList> {
+    return this.withConn(async (c) => {
+      const id = (((await c.execute<any>(`SELECT ${this.app('SEQ_LOC_LIST')}.NEXTVAL AS ID FROM DUAL`)).rows![0]) as any).ID as number;
+      await c.execute(`INSERT INTO ${this.app('LOC_LIST')} (LOC_LIST_ID, LOC_LIST_NAME, DESCRIPTION, CREATED_BY) VALUES (:id,:n,:d,:cb)`, { id, n: input.name, d: input.description ?? null, cb: input.createdBy }, { autoCommit: false });
+      if (input.storeIds.length) await c.executeMany(`INSERT INTO ${this.app('LOC_LIST_STORE')} (LOC_LIST_ID, STORE_ID) VALUES (:id,:s)`, input.storeIds.map((s) => ({ id, s })), { autoCommit: false });
+      await c.commit();
+      const out = await this.getLocationList(id); if (!out) throw new Error('readback failed'); return out;
+    });
+  }
+  async updateLocationList(id: number, patch: { name?: string; description?: string | null; storeIds?: number[] }): Promise<LocationList | null> {
+    return this.withConn(async (c) => {
+      const existing = await this.getLocationList(id); if (!existing) return null;
+      if (patch.name !== undefined || patch.description !== undefined)
+        await c.execute(`UPDATE ${this.app('LOC_LIST')} SET LOC_LIST_NAME=NVL(:n,LOC_LIST_NAME), DESCRIPTION=:d WHERE LOC_LIST_ID=:id`, { id, n: patch.name ?? null, d: patch.description !== undefined ? patch.description : existing.description ?? null }, { autoCommit: false });
+      if (patch.storeIds !== undefined) {
+        await c.execute(`DELETE FROM ${this.app('LOC_LIST_STORE')} WHERE LOC_LIST_ID=:id`, { id }, { autoCommit: false });
+        if (patch.storeIds.length) await c.executeMany(`INSERT INTO ${this.app('LOC_LIST_STORE')} (LOC_LIST_ID, STORE_ID) VALUES (:id,:s)`, patch.storeIds.map((s) => ({ id, s })), { autoCommit: false });
+      }
+      await c.commit(); return this.getLocationList(id);
+    });
+  }
+  async deleteLocationList(id: number): Promise<boolean> {
+    return this.withConn(async (c) => ((await c.execute(`DELETE FROM ${this.app('LOC_LIST')} WHERE LOC_LIST_ID=:id`, { id }, { autoCommit: true })).rowsAffected ?? 0) > 0);
+  }
+
+  async listSkuLists(): Promise<SkuList[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT l.SKU_LIST_ID, l.SKU_LIST_NAME, l.DESCRIPTION, l.CREATED_BY, l.CREATED_AT, li.SKU FROM ${this.app('SKU_LIST')} l LEFT JOIN ${this.app('SKU_LIST_ITEM')} li ON li.SKU_LIST_ID=l.SKU_LIST_ID ORDER BY l.SKU_LIST_ID, li.SKU`);
+      const map = new Map<number, SkuList>();
+      for (const row of (r.rows ?? []) as any[]) {
+        let l = map.get(row.SKU_LIST_ID);
+        if (!l) { l = { skuListId: row.SKU_LIST_ID, skuListName: row.SKU_LIST_NAME, description: row.DESCRIPTION, createdBy: row.CREATED_BY, createdAt: (row.CREATED_AT as Date).toISOString(), skus: [] }; map.set(row.SKU_LIST_ID, l); }
+        if (row.SKU != null) l.skus.push(row.SKU);
+      }
+      return [...map.values()];
+    });
+  }
+  async getSkuList(id: number): Promise<SkuList | null> { return (await this.listSkuLists()).find((l) => l.skuListId === id) ?? null; }
+  async createSkuList(input: { name: string; description?: string | null; skus: number[]; createdBy: string }): Promise<SkuList> {
+    return this.withConn(async (c) => {
+      const id = (((await c.execute<any>(`SELECT ${this.app('SEQ_SKU_LIST')}.NEXTVAL AS ID FROM DUAL`)).rows![0]) as any).ID as number;
+      await c.execute(`INSERT INTO ${this.app('SKU_LIST')} (SKU_LIST_ID, SKU_LIST_NAME, DESCRIPTION, CREATED_BY) VALUES (:id,:n,:d,:cb)`, { id, n: input.name, d: input.description ?? null, cb: input.createdBy }, { autoCommit: false });
+      if (input.skus.length) await c.executeMany(`INSERT INTO ${this.app('SKU_LIST_ITEM')} (SKU_LIST_ID, SKU) VALUES (:id,:s)`, input.skus.map((s) => ({ id, s })), { autoCommit: false });
+      await c.commit();
+      const out = await this.getSkuList(id); if (!out) throw new Error('readback failed'); return out;
+    });
+  }
+  async updateSkuList(id: number, patch: { name?: string; description?: string | null; skus?: number[] }): Promise<SkuList | null> {
+    return this.withConn(async (c) => {
+      const existing = await this.getSkuList(id); if (!existing) return null;
+      if (patch.name !== undefined || patch.description !== undefined)
+        await c.execute(`UPDATE ${this.app('SKU_LIST')} SET SKU_LIST_NAME=NVL(:n,SKU_LIST_NAME), DESCRIPTION=:d WHERE SKU_LIST_ID=:id`, { id, n: patch.name ?? null, d: patch.description !== undefined ? patch.description : existing.description ?? null }, { autoCommit: false });
+      if (patch.skus !== undefined) {
+        await c.execute(`DELETE FROM ${this.app('SKU_LIST_ITEM')} WHERE SKU_LIST_ID=:id`, { id }, { autoCommit: false });
+        if (patch.skus.length) await c.executeMany(`INSERT INTO ${this.app('SKU_LIST_ITEM')} (SKU_LIST_ID, SKU) VALUES (:id,:s)`, patch.skus.map((s) => ({ id, s })), { autoCommit: false });
+      }
+      await c.commit(); return this.getSkuList(id);
+    });
+  }
+  async deleteSkuList(id: number): Promise<boolean> {
+    return this.withConn(async (c) => ((await c.execute(`DELETE FROM ${this.app('SKU_LIST')} WHERE SKU_LIST_ID=:id`, { id }, { autoCommit: true })).rowsAffected ?? 0) > 0);
+  }
+
+  // A resolved set can be billions of (PC x SKU x STORE) rows; the app never pulls
+  // the full set. We fetch at most RESOLVED_SAMPLE_CAP ids per PC, via TWO separate
+  // queries (NOT a PC_SKU x PC_STORE join, which would explode to skus*stores rows).
+  // Authoritative counts/promotion are done set-based inside Oracle.
+  private static readonly RESOLVED_SAMPLE_CAP = 5000;
+
+  async listPriceChanges(filter?: { status?: PCStatus }): Promise<PriceChange[]> {
+    return this.withConn(async (c) => {
+      const heads = await c.execute<any>(
+        `SELECT pc.* FROM ${this.app('LOC_LIST_PRICE_CHANGE')} pc WHERE :status IS NULL OR pc.STATUS=:status ORDER BY pc.PC_ID DESC`,
+        { status: filter?.status ?? null });
+      const pcs = (heads.rows ?? []).map((row: any) => this.rowToPc(row));
+      if (pcs.length) await this.attachResolvedSamples(c, pcs);
+      return pcs;
+    });
+  }
+  // Capped reverse fetch of resolved skus + stores for the given PCs. Each query
+  // is partition-pruned by PC_ID and capped per PC with ROW_NUMBER, so the app
+  // pulls a bounded sample no matter how large the resolved set is.
+  private async attachResolvedSamples(c: oracledb.Connection, pcs: PriceChange[]): Promise<void> {
+    const cap = OracleStore.RESOLVED_SAMPLE_CAP;
+    const byId = new Map(pcs.map((p) => [p.pcId, p]));
+    const inList = pcs.map((p) => Number(p.pcId)).join(',');   // ids are numbers — safe to inline
+    const skuRows = await c.execute<any>(
+      `SELECT PC_ID, SKU FROM (SELECT PC_ID, SKU, ROW_NUMBER() OVER (PARTITION BY PC_ID ORDER BY SKU) rn
+         FROM ${this.app('LOC_LIST_PC_SKU')} WHERE PC_ID IN (${inList})) WHERE rn <= ${cap}`);
+    for (const row of (skuRows.rows ?? []) as any[]) byId.get(row.PC_ID)?.resolvedSkus.push(row.SKU);
+    const storeRows = await c.execute<any>(
+      `SELECT PC_ID, STORE_ID FROM (SELECT PC_ID, STORE_ID, ROW_NUMBER() OVER (PARTITION BY PC_ID ORDER BY STORE_ID) rn
+         FROM ${this.app('LOC_LIST_PC_STORE')} WHERE PC_ID IN (${inList})) WHERE rn <= ${cap}`);
+    for (const row of (storeRows.rows ?? []) as any[]) byId.get(row.PC_ID)?.resolvedStoreIds.push(row.STORE_ID);
+  }
+  private rowToPc(row: any): PriceChange {
+    return {
+      pcId: row.PC_ID, pcName: row.PC_NAME,
+      itemSelector: JSON.parse(row.ITEM_SELECTOR ?? '{"mode":"SINGLE_SKU"}'),
+      locationSelector: JSON.parse(row.LOCATION_SELECTOR ?? '{"mode":"STORES"}'),
+      resolvedSkus: [], resolvedStoreIds: [],
+      changeType: row.CHANGE_TYPE, amount: Number(row.AMOUNT),
+      roundingRule: row.ROUNDING_RULE ?? 'NONE', endsIn: row.ENDS_IN != null ? Number(row.ENDS_IN) : null,
+      multiUnits: row.MULTI_UNITS != null ? Number(row.MULTI_UNITS) : null, multiRetail: row.MULTI_RETAIL != null ? Number(row.MULTI_RETAIL) : null,
+      fundedByVendor: row.FUNDED_BY_VENDOR === 'Y', dealId: row.DEAL_ID ?? null,
+      fundingVendorId: row.FUNDING_VENDOR_ID != null ? Number(row.FUNDING_VENDOR_ID) : null, fundingPct: row.FUNDING_PCT != null ? Number(row.FUNDING_PCT) : null,
+      sendDate: (row.SEND_DATE as Date).toISOString().slice(0, 10), effectiveDate: (row.EFFECTIVE_DATE as Date).toISOString().slice(0, 10),
+      reasonCode: row.REASON_CODE, status: row.STATUS, requiredTier: row.REQUIRED_TIER ?? 1, approvedTiers: [], approvalLog: [], createdBy: row.CREATED_BY, createdAt: (row.CREATED_AT as Date).toISOString(),
+    };
+  }
+  async getPriceChange(id: number): Promise<PriceChange | null> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT pc.* FROM ${this.app('LOC_LIST_PRICE_CHANGE')} pc WHERE pc.PC_ID=:id`, { id });
+      const row = (r.rows ?? [])[0]; if (!row) return null;
+      const pc = this.rowToPc(row);
+      await this.attachResolvedSamples(c, [pc]);
+      return pc;
+    });
+  }
+  async createPriceChange(input: NewPriceChangeInput): Promise<PriceChange> {
+    const sendDate = input.sendDate ?? isoMinusDays(input.effectiveDate, config.app.leadTimes.SEND);
+    return this.withConn(async (c) => {
+      const id = (((await c.execute<any>(`SELECT ${this.app('SEQ_LOC_LIST_PC')}.NEXTVAL AS ID FROM DUAL`)).rows![0]) as any).ID as number;
+      // Persist the header with the JSON selectors only — we never ship resolved
+      // SKU/store id sets (up to ~400K x ~10K) through the app tier.
+      await c.execute(
+        `INSERT INTO ${this.app('LOC_LIST_PRICE_CHANGE')}
+           (PC_ID, PC_NAME, ITEM_SELECTOR, LOCATION_SELECTOR, CHANGE_TYPE, AMOUNT, ROUNDING_RULE, ENDS_IN,
+            MULTI_UNITS, MULTI_RETAIL, FUNDED_BY_VENDOR, DEAL_ID, FUNDING_VENDOR_ID, FUNDING_PCT,
+            SEND_DATE, EFFECTIVE_DATE, REASON_CODE, STATUS, CREATED_BY)
+         VALUES (:id,:n,:isel,:lsel,:t,:amt,:rule,:ends,:mu,:mr,:fund,:deal,:fv,:fp,
+                 TO_DATE(:sd,'YYYY-MM-DD'), TO_DATE(:ed,'YYYY-MM-DD'), :reason,'WORKSHEET',:cb)`,
+        {
+          id, n: input.pcName, isel: JSON.stringify(input.itemSelector), lsel: JSON.stringify(input.locationSelector),
+          t: input.changeType, amt: input.amount, rule: input.roundingRule ?? 'NONE', ends: input.endsIn ?? null,
+          mu: input.multiUnits ?? null, mr: input.multiRetail ?? null, fund: input.fundedByVendor ? 'Y' : 'N',
+          deal: input.dealId ?? null, fv: input.fundingVendorId ?? null, fp: input.fundingPct ?? null,
+          sd: sendDate, ed: input.effectiveDate, reason: input.reasonCode, cb: input.createdBy,
+        }, { autoCommit: true });
+      // Set-based resolution INSIDE Oracle: expands the JSON selector into the
+      // snapshot tables using GLOBAL TEMPORARY TABLEs + direct-path/parallel DML.
+      // (Rezone ZONE_INHERIT price maps are applied during promote; a production
+      //  schema would persist priceMap in a dedicated child table.)
+      await c.execute(`BEGIN PKG_FDPM_PRICING.resolve_price_change(:id, :sku, :store); END;`,
+        { id, sku: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER }, store: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } },
+        { autoCommit: true });
+      const out = await this.getPriceChange(id); if (!out) throw new Error('readback failed'); return out;
+    });
+  }
+  async updatePriceChangeStatus(id: number, status: PCStatus): Promise<PriceChange | null> {
+    return this.withConn(async (c) => {
+      const r = await c.execute(`UPDATE ${this.app('LOC_LIST_PRICE_CHANGE')} SET STATUS=:s, PROMOTED_AT=CASE WHEN :s='PROMOTED' THEN SYSTIMESTAMP ELSE PROMOTED_AT END WHERE PC_ID=:id`, { id, s: status }, { autoCommit: true });
+      if ((r.rowsAffected ?? 0) === 0) return null; return this.getPriceChange(id);
+    });
+  }
+
+
+  // Approval workflow stubs — implemented in MemoryStore. A production Oracle
+  // build wires these to FDPM_PC_APPROVAL / FDPM_PC_APPROVAL_LOG.
+  async submitForApproval(_id: number, _actor: string, _requiredTier: number): Promise<PriceChange | null> { throw new Error('submitForApproval not implemented in OracleStore'); }
+  async approvePc(_id: number, _actor: string, _role: Role, _tier: number, _comment: string | null): Promise<PriceChange | null> { throw new Error('approvePc not implemented in OracleStore'); }
+  async rejectPc(_id: number, _actor: string, _role: Role, _comment: string | null): Promise<PriceChange | null> { throw new Error('rejectPc not implemented in OracleStore'); }
+  async commentOnPc(_id: number, _actor: string, _role: Role, _comment: string): Promise<PriceChange | null> { throw new Error('commentOnPc not implemented in OracleStore'); }
+
+  // -------- execution: calls PKG_FDPM_PRICING (set-based, server-side) --------
+  async resolvePriceChange(pcId: number): Promise<{ skuCount: number; storeCount: number } | null> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(
+        `BEGIN PKG_FDPM_PRICING.resolve_price_change(:id, :sku, :store); END;`,
+        { id: pcId, sku: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER }, store: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } },
+        { autoCommit: true });
+      const out = r.outBinds as any;
+      return { skuCount: Number(out.sku), storeCount: Number(out.store) };
+    });
+  }
+
+  // -------- rezone (POC: priceMap/rezone are not persisted to a column here;
+  // a production schema would add columns and the membership move would be a PKG call) --------
+  async previewRezone(input: RezoneInput): Promise<RezonePreview> {
+    const r = await this.computeRezoneOracle(input);
+    return { toZoneGroupId: input.toZoneGroupId, toZoneId: input.toZoneId, toZoneName: r.toZoneName, movingStoreIds: r.movingStoreIds, movingStoreCount: r.movingStoreIds.length, repriceCount: r.lines.length, sample: r.lines.slice(0, 200) };
+  }
+  async createRezone(input: RezoneInput): Promise<{ priceChange: PriceChange; preview: RezonePreview }> {
+    const r = await this.computeRezoneOracle(input);
+    const priceMap = r.lines.map((l) => ({ sku: l.sku, newRetail: l.newRetail }));
+    const eff = new Date(Date.now() + 7 * 86400_000).toISOString().slice(0, 10);
+    const pc = await this.createPriceChange({
+      pcName: `Rezone ${r.movingStoreIds.length} store(s) -> ${r.toZoneName}`,
+      itemSelector: { mode: 'SKU_LIST', skus: priceMap.map((m) => m.sku) },
+      locationSelector: { mode: 'STORES', storeIds: r.movingStoreIds },
+      changeType: 'ZONE_INHERIT', amount: 0, roundingRule: 'NONE', effectiveDate: eff, reasonCode: null,
+      priceMap, rezone: { toZoneGroupId: input.toZoneGroupId, toZoneId: input.toZoneId, fromZoneId: input.fromZoneId ?? null },
+      createdBy: input.createdBy ?? 'rezone',
+    });
+    const preview: RezonePreview = { toZoneGroupId: input.toZoneGroupId, toZoneId: input.toZoneId, toZoneName: r.toZoneName, movingStoreIds: r.movingStoreIds, movingStoreCount: r.movingStoreIds.length, repriceCount: r.lines.length, sample: r.lines.slice(0, 200) };
+    return { priceChange: pc, preview };
+  }
+  private async computeRezoneOracle(input: RezoneInput): Promise<{ movingStoreIds: number[]; toZoneName: string; lines: RezonePreviewLine[] }> {
+    const zones = await this.listZones(input.toZoneGroupId);
+    const toZone = zones.find((z) => z.zoneId === input.toZoneId);
+    const toZoneName = toZone?.zoneName ?? `Zone ${input.toZoneId}`;
+    let movingStoreIds: number[] = [];
+    if (input.storeIds?.length) movingStoreIds = [...new Set(input.storeIds)];
+    else if (input.locListId != null) movingStoreIds = (await this.getLocationList(input.locListId))?.storeIds ?? [];
+    else if (input.fromZoneId != null) movingStoreIds = zones.find((z) => z.zoneId === input.fromZoneId)?.storeIds ?? [];
+    const targetStores = new Set(toZone?.storeIds ?? []);
+    const movingSet = new Set(movingStoreIds);
+    const items = await this.listItems();
+    const baseBySku = new Map(items.map((i) => [i.sku, i.currentRetail ?? null]));
+    const descBySku = new Map(items.map((i) => [i.sku, i.description]));
+    const promoted = (await this.listPriceChanges({ status: 'PROMOTED' })).sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate));
+    const overrides = (storeSet: Set<number>) => {
+      const out = new Map<number, number>();
+      for (const pc of promoted) if (pc.resolvedStoreIds.some((sid) => storeSet.has(sid))) for (const sku of pc.resolvedSkus) {
+        const price = pcPriceForSku(pc, sku, baseBySku.get(sku) ?? null);
+        if (price != null) out.set(sku, price);
+      }
+      return out;
+    };
+    const targetOv = overrides(targetStores); const curOv = overrides(movingSet);
+    const skus = new Set<number>([...targetOv.keys(), ...curOv.keys()]);
+    const lines: RezonePreviewLine[] = [];
+    for (const sku of skus) {
+      const base = baseBySku.get(sku) ?? null;
+      const tp = targetOv.has(sku) ? targetOv.get(sku)! : base;
+      const cp = curOv.has(sku) ? curOv.get(sku)! : base;
+      if (tp != null && tp !== cp) lines.push({ sku, description: descBySku.get(sku) ?? '', currentRetail: cp, newRetail: tp });
+    }
+    lines.sort((a, b) => a.sku - b.sku);
+    return { movingStoreIds, toZoneName, lines };
+  }
+  async promotePriceChange(pcId: number): Promise<PriceChange | null> {
+    await this.withConn(async (c) => { await c.execute(`BEGIN PKG_FDPM_PRICING.promote_price_change(:id); END;`, { id: pcId }, { autoCommit: true }); });
+    return this.getPriceChange(pcId);
+  }
+  async submitJob(pcId: number, jobType: JobType): Promise<PcJob> {
+    const jobId = await this.withConn(async (c) => {
+      const r = await c.execute<any>(`BEGIN :j := PKG_FDPM_PRICING.submit_async(:id, :t); END;`,
+        { j: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER }, id: pcId, t: jobType }, { autoCommit: true });
+      return Number((r.outBinds as any).j);
+    });
+    const job = await this.getJob(jobId);
+    if (!job) throw new Error('job readback failed');
+    return job;
+  }
+  async getJob(jobId: number): Promise<PcJob | null> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT JOB_ID, PC_ID, JOB_TYPE, STATUS, SKU_COUNT, STORE_COUNT, MESSAGE, CREATED_AT, STARTED_AT, FINISHED_AT FROM ${this.app('PC_JOB')} WHERE JOB_ID=:id`, { id: jobId });
+      const row = (r.rows ?? [])[0] as any; if (!row) return null;
+      return this.rowToJob(row);
+    });
+  }
+  async listJobs(pcId?: number): Promise<PcJob[]> {
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(`SELECT JOB_ID, PC_ID, JOB_TYPE, STATUS, SKU_COUNT, STORE_COUNT, MESSAGE, CREATED_AT, STARTED_AT, FINISHED_AT FROM ${this.app('PC_JOB')} WHERE :pc IS NULL OR PC_ID=:pc ORDER BY JOB_ID DESC`, { pc: pcId ?? null });
+      return (r.rows ?? []).map((row: any) => this.rowToJob(row));
+    });
+  }
+  private rowToJob(row: any): PcJob {
+    return { jobId: row.JOB_ID, pcId: row.PC_ID, jobType: row.JOB_TYPE, status: row.STATUS,
+      skuCount: row.SKU_COUNT != null ? Number(row.SKU_COUNT) : null, storeCount: row.STORE_COUNT != null ? Number(row.STORE_COUNT) : null,
+      message: row.MESSAGE ?? null, createdAt: (row.CREATED_AT as Date).toISOString(),
+      startedAt: row.STARTED_AT ? (row.STARTED_AT as Date).toISOString() : null, finishedAt: row.FINISHED_AT ? (row.FINISHED_AT as Date).toISOString() : null };
+  }
+
+  async listCalendarActivities(range?: { from?: string; to?: string }, scope?: CalendarScope): Promise<CalendarActivity[]> {
+    const zg = scope?.zoneGroupId ?? null; const zid = scope?.zoneId ?? null;
+    return this.withConn(async (c) => {
+      const r = await c.execute<any>(
+        `SELECT ACTIVITY_ID, TITLE, ACTIVITY_TYPE, ACTIVITY_DATE, SOURCE, ZONE_GROUP_ID, ZONE_ID, LEAD_TIME_DAYS, RELATED_PC_ID, NOTES FROM ${this.app('CALENDAR_ACTIVITY')}
+         WHERE (:from IS NULL OR ACTIVITY_DATE>=TO_DATE(:from,'YYYY-MM-DD')) AND (:to IS NULL OR ACTIVITY_DATE<=TO_DATE(:to,'YYYY-MM-DD'))
+           AND ( (:zg IS NULL AND :zid IS NULL)
+                 OR (ZONE_GROUP_ID IS NULL AND ZONE_ID IS NULL)
+                 OR (:zg IS NOT NULL AND ZONE_GROUP_ID = :zg AND (:zid IS NULL OR ZONE_ID = :zid)) )
+         ORDER BY ACTIVITY_DATE`,
+        { from: range?.from ?? null, to: range?.to ?? null, zg, zid });
+      return (r.rows ?? []).map((row: any) => ({ activityId: row.ACTIVITY_ID, title: row.TITLE, type: row.ACTIVITY_TYPE, date: (row.ACTIVITY_DATE as Date).toISOString().slice(0, 10), source: row.SOURCE ?? 'MANUAL', zoneGroupId: row.ZONE_GROUP_ID, zoneId: row.ZONE_ID, leadTimeDays: row.LEAD_TIME_DAYS, relatedPcId: row.RELATED_PC_ID, notes: row.NOTES }));
+    });
+  }
+  async createCalendarActivity(input: NewCalendarActivity): Promise<CalendarActivity> {
+    return this.withConn(async (c) => {
+      const id = (((await c.execute<any>(`SELECT ${this.app('SEQ_CALENDAR_ACTIVITY')}.NEXTVAL AS ID FROM DUAL`)).rows![0]) as any).ID as number;
+      await c.execute(`INSERT INTO ${this.app('CALENDAR_ACTIVITY')} (ACTIVITY_ID, TITLE, ACTIVITY_TYPE, ACTIVITY_DATE, SOURCE, ZONE_GROUP_ID, ZONE_ID, LEAD_TIME_DAYS, RELATED_PC_ID, NOTES) VALUES (:id,:t,:ty,TO_DATE(:dt,'YYYY-MM-DD'),:src,:zg,:zid,:l,:pc,:no)`, { id, t: input.title, ty: input.type, dt: input.date, src: input.source ?? 'MANUAL', zg: input.zoneGroupId ?? null, zid: input.zoneId ?? null, l: input.leadTimeDays ?? null, pc: input.relatedPcId ?? null, no: input.notes ?? null }, { autoCommit: true });
+      return { activityId: id, title: input.title, type: input.type, date: input.date, source: input.source ?? 'MANUAL', zoneGroupId: input.zoneGroupId ?? null, zoneId: input.zoneId ?? null, leadTimeDays: input.leadTimeDays ?? null, relatedPcId: input.relatedPcId ?? null, notes: input.notes ?? null };
+    });
+  }
+  async deleteCalendarActivity(id: number): Promise<boolean> {
+    return this.withConn(async (c) => ((await c.execute(`DELETE FROM ${this.app('CALENDAR_ACTIVITY')} WHERE ACTIVITY_ID=:id`, { id }, { autoCommit: true })).rowsAffected ?? 0) > 0);
+  }
+  async replaceAiActivities(range: { from?: string; to?: string }, scope: { zoneGroupId?: number | null; zoneId?: number | null }, items: NewCalendarActivity[]): Promise<CalendarActivity[]> {
+    const zg = scope?.zoneGroupId ?? null; const zid = scope?.zoneId ?? null;
+    return this.withConn(async (c) => {
+      await c.execute(
+        `DELETE FROM ${this.app('CALENDAR_ACTIVITY')} WHERE SOURCE='AI'
+           AND (:from IS NULL OR ACTIVITY_DATE>=TO_DATE(:from,'YYYY-MM-DD')) AND (:to IS NULL OR ACTIVITY_DATE<=TO_DATE(:to,'YYYY-MM-DD'))
+           AND (NVL(ZONE_GROUP_ID,-1)=NVL(:zg,-1)) AND (NVL(ZONE_ID,-1)=NVL(:zid,-1))`,
+        { from: range.from ?? null, to: range.to ?? null, zg, zid }, { autoCommit: false });
+      const out: CalendarActivity[] = [];
+      for (const it of items) {
+        const id = (((await c.execute<any>(`SELECT ${this.app('SEQ_CALENDAR_ACTIVITY')}.NEXTVAL AS ID FROM DUAL`)).rows![0]) as any).ID as number;
+        await c.execute(
+          `INSERT INTO ${this.app('CALENDAR_ACTIVITY')} (ACTIVITY_ID, TITLE, ACTIVITY_TYPE, ACTIVITY_DATE, SOURCE, ZONE_GROUP_ID, ZONE_ID, NOTES) VALUES (:id,:t,:ty,TO_DATE(:dt,'YYYY-MM-DD'),'AI',:zg,:zid,:no)`,
+          { id, t: it.title, ty: it.type, dt: it.date, zg, zid, no: it.notes ?? null }, { autoCommit: false });
+        out.push({ activityId: id, title: it.title, type: it.type, date: it.date, source: 'AI', zoneGroupId: zg, zoneId: zid, leadTimeDays: null, relatedPcId: null, notes: it.notes ?? null });
+      }
+      await c.commit();
+      return out;
+    });
+  }
+}
