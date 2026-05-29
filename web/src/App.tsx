@@ -94,14 +94,14 @@ export default function App() {
             </>
           ) : <span className="text-slate-300">connecting…</span>}
           <div className="pt-1 text-[10px] text-slate-300">POC · extends RMS zone pricing</div>
-        </div>
-          <div className="mt-2 border-t border-slate-100 pt-3">
-            <button onClick={() => setPickerOpen(true)} className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-[11px] font-medium transition hover:bg-slate-50" style={{ color: 'var(--sidebar-fg-muted)' }}>
+          <div className="relative mt-2 border-t border-slate-100 pt-3">
+            <button data-theme-toggle onClick={() => setPickerOpen((v) => !v)} className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-[11px] font-medium transition hover:bg-slate-50" style={{ color: 'var(--sidebar-fg-muted)' }}>
               <span>Brand &amp; theme</span>
-              <span className="inline-block h-3.5 w-3.5 rounded-sm" style={{ background: 'var(--brand-primary)' }} />
+              <span className="inline-block h-3.5 w-3.5 rounded-sm shadow-sm" style={{ background: 'var(--brand-primary)' }} />
             </button>
+            {pickerOpen && <ThemePicker onClose={() => { setPickerOpen(false); setTheme(themeApi.get().theme); }} />}
           </div>
-        {pickerOpen && <ThemePicker onClose={() => { setPickerOpen(false); setTheme(themeApi.get().theme); }} />}
+        </div>
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
