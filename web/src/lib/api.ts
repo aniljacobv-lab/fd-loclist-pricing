@@ -204,6 +204,39 @@ export interface VectorItemSearchResponse { provider: string; query?: string; se
 export interface VectorPcHit { pcId: number; similarity: number; pcName: string | null; status: PCStatus | null; changeType: ChangeType | null; amount: number | null; effectiveDate: string | null; skuCount: number; storeCount: number; }
 export interface VectorPcSimilarResponse { provider: string; seed: { pcId: number; pcName: string | null }; hits: VectorPcHit[]; }
 
+// ----- AI strategy -----
+export interface StrategyRecommendation {
+  kind: string;          // 'EDLP' | 'MARKDOWN_PCT' | 'MARKDOWN_AMT' | 'SET_PRICE'
+  changeType: ChangeType;
+  amount: number;
+  effectiveDate: string;
+  scopeNote: string;
+  rationale: string;
+  confidence: 'high' | 'medium' | 'low';
+}
+export interface StrategyContext {
+  date: string;
+  season: string;
+  seasonalNotes: string[];
+  weatherNotes: string[];
+  upcomingHolidays: { date: string; name: string; daysUntil: number }[];
+  topRegions: { region: string; pct: number; storeCount: number }[];
+}
+export interface StrategyScope {
+  skuCount: number; storeCount: number; itemLocations: number;
+  sampledItems: number;
+  topDepts: { name: string; deptId: number | null; share: number; count: number }[];
+  topRegions: { region: string; pct: number; storeCount: number }[];
+  avgPrice: number | null; minPrice: number | null; maxPrice: number | null; avgCost: number | null;
+}
+export interface StrategyResponse {
+  aiUsed: boolean;
+  strategy: 'AUTO' | 'EDLP' | 'MARKDOWN';
+  scope: StrategyScope;
+  context: StrategyContext;
+  recommendations: StrategyRecommendation[];
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // Only declare a JSON content-type when we're actually sending a body.
   // Otherwise Fastify rejects empty-body POSTs with FST_ERR_CTP_EMPTY_JSON_BODY
@@ -357,6 +390,8 @@ export const api = {
   },
 
   aiGroupStores: (body: { numClusters: number; hint?: string; storeIds?: number[] }) => req<{ clusters: Array<{ name: string; rationale: string; storeIds: number[] }>; stub?: boolean }>('/ai/group-stores', { method: 'POST', body: JSON.stringify(body) }),
+  aiSuggestStrategy: (body: { itemSelector: ItemSelector; locationSelector?: LocationSelector | null; strategy?: 'AUTO' | 'EDLP' | 'MARKDOWN' }) =>
+    req<StrategyResponse>('/ai/suggest-strategy', { method: 'POST', body: JSON.stringify(body) }),
   aiSuggestPrice: (body: { sku: number; reasonCode?: number | null; sellThrough?: number | null; weeksOnHand?: number | null }) => req<{ changeType: ChangeType; amount: number; rationale: string }>('/ai/suggest-price', { method: 'POST', body: JSON.stringify(body) }),
   aiParseIntent: (text: string) => req<{ pcName: string; sku: number | null; skuQuery: string | null; storeQuery: string | null; changeType: ChangeType; amount: number; effectiveDate: string | null; rationale: string }>('/ai/parse-intent', { method: 'POST', body: JSON.stringify({ text }) }),
 };

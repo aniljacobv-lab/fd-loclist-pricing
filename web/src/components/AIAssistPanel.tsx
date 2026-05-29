@@ -2,8 +2,12 @@ import { useState } from 'react';
 import { api, type ChangeType, type VectorStatus } from '../lib/api';
 import { SimilarItems } from './SimilarItems';
 
+import type { ItemSelector, LocationSelector, StrategyRecommendation, StrategyResponse } from '../lib/api';
+
 interface Props {
   sku: number | null;
+  itemSelector: ItemSelector;
+  locationSelector: LocationSelector;
   onApplyDraft: (draft: {
     pcName?: string;
     sku?: number | null;
@@ -14,7 +18,7 @@ interface Props {
   }) => void;
 }
 
-export function AIAssistPanel({ sku, onApplyDraft }: Props) {
+export function AIAssistPanel({ sku, itemSelector, locationSelector, onApplyDraft }: Props) {
   const [tab, setTab] = useState<'nl' | 'group' | 'suggest' | 'find'>('nl');
   const [findQuery, setFindQuery] = useState('');
   const [vectorStatus, setVectorStatus] = useState<VectorStatus | null>(null);
@@ -46,7 +50,7 @@ export function AIAssistPanel({ sku, onApplyDraft }: Props) {
 
       {tab === 'nl' && <NLPanel onApplyDraft={onApplyDraft} />}
       {tab === 'group' && <GroupPanel onApplyDraft={onApplyDraft} />}
-      {tab === 'suggest' && <SuggestPanel sku={sku} onApplyDraft={onApplyDraft} />}
+      {tab === 'suggest' && <SuggestPanel sku={sku} itemSelector={itemSelector} locationSelector={locationSelector} onApplyDraft={onApplyDraft} />}
 
       {tab === 'find' && (
         <div className="space-y-3">
@@ -141,33 +145,65 @@ function GroupPanel({ onApplyDraft }: { onApplyDraft: Props['onApplyDraft'] }) {
   );
 }
 
-function SuggestPanel({ sku, onApplyDraft }: { sku: number | null; onApplyDraft: Props['onApplyDraft'] }) {
-  const [reasonCode, setReasonCode] = useState(9);
-  const [sellThrough, setSellThrough] = useState(0.35);
+function SuggestPanel({ sku, itemSelector, locationSelector, onApplyDraft }: { sku: number | null; itemSelector: ItemSelector; locationSelector: LocationSelector; onApplyDraft: Props['onApplyDraft'] }) {
+  const [strategy, setStrategy] = useState<'AUTO' | 'EDLP' | 'MARKDOWN'>('AUTO');
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ changeType: string; amount: number; rationale: string } | null>(null);
+  const [data, setData] = useState<StrategyResponse | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
   async function go() {
-    if (!sku) return;
-    setBusy(true);
-    try { setResult(await api.aiSuggestPrice({ sku, reasonCode, sellThrough })); } finally { setBusy(false); }
+    setBusy(true); setErr(null);
+    try { setData(await api.aiSuggestStrategy({ itemSelector, locationSelector, strategy })); }
+    catch (e: any) { setErr(String(e?.message ?? e)); }
+    finally { setBusy(false); }
   }
+
+  const confTone = (c: string) => c === 'high' ? 'bg-green-50 text-green-700' : c === 'medium' ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-600';
+  const formatAmount = (r: StrategyRecommendation) => r.changeType === 'MARKDOWN_PCT' ? `${r.amount}% off` : r.changeType === 'MARKDOWN_AMT' ? `$${r.amount.toFixed(2)} off` : `Set $${r.amount.toFixed(2)}`;
+
   return (
-    <div className="space-y-2 text-sm">
-      {!sku && <p className="rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-700">Pick a single SKU first.</p>}
-      <div className="grid grid-cols-2 gap-2">
-        <div><label className="fd-label">Reason</label>
-          <input type="number" value={reasonCode} onChange={(e) => setReasonCode(Number(e.target.value))} className="fd-input" /></div>
-        <div><label className="fd-label">Sell-through</label>
-          <input type="number" step={0.05} min={0} max={1} value={sellThrough} onChange={(e) => setSellThrough(Number(e.target.value))} className="fd-input" /></div>
-      </div>
-      <button onClick={go} disabled={!sku || busy} className="fd-btn fd-btn-primary w-full">{busy ? 'Thinking…' : 'Suggest a markdown'}</button>
-      {result && (
-        <div className="rounded-lg border border-slate-200 p-3 text-xs">
-          <div className="font-semibold text-slate-800">{result.changeType} → {result.amount}</div>
-          <p className="mt-1 text-slate-500">{result.rationale}</p>
-          <button onClick={() => onApplyDraft({ changeType: result.changeType as any, amount: result.amount })}
-            className="fd-btn fd-btn-primary mt-2 h-8 px-3 text-xs">Apply to form</button>
+    <div className="space-y-3 text-sm">
+      <div>
+        <label className="fd-label">Strategy</label>
+        <div className="fd-seg w-full">
+          {(['AUTO', 'EDLP', 'MARKDOWN'] as const).map((k) => (
+            <button key={k} onClick={() => setStrategy(k)} className={`fd-seg-item ${strategy === k ? 'fd-seg-item-active' : ''}`}>{k === 'AUTO' ? 'Let AI decide' : k === 'EDLP' ? 'EDLP' : 'Markdown'}</button>
+          ))}
         </div>
+        <p className="mt-1 text-[11px] text-slate-400">Works for any scope — single SKU, hierarchy, SKU list, vendor, or all items. Pulls in season, weather, holidays, and your store regional mix.</p>
+      </div>
+
+      <button onClick={go} disabled={busy} className="fd-btn fd-btn-primary w-full">{busy ? 'Analyzing…' : sku != null ? 'Suggest strategy for this SKU' : 'Suggest strategy for current scope'}</button>
+
+      {err && <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{err}</div>}
+
+      {data && (
+        <>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+            <div className="font-medium text-slate-700">Scope</div>
+            <div className="mt-0.5">{data.scope.skuCount.toLocaleString()} SKUs × {data.scope.storeCount.toLocaleString()} stores · avg {data.scope.avgPrice != null ? `$${data.scope.avgPrice.toFixed(2)}` : '—'}</div>
+            {data.scope.topDepts.length > 0 && <div className="mt-0.5 text-slate-500">Top: {data.scope.topDepts.slice(0, 3).map((d) => `${d.name} ${d.share}%`).join(' · ')}</div>}
+            <div className="mt-1 font-medium text-slate-700">Context</div>
+            <div className="mt-0.5 text-slate-500">{data.context.date} · {data.context.season}{data.context.upcomingHolidays[0] ? ` · ${data.context.upcomingHolidays[0].name} in ${data.context.upcomingHolidays[0].daysUntil}d` : ''}</div>
+            {data.context.weatherNotes[0] && <div className="mt-0.5 italic text-slate-500">{data.context.weatherNotes[0]}</div>}
+            <div className="mt-1"><span className={`fd-pill ${data.aiUsed ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-500'}`}>{data.aiUsed ? 'AI-generated' : 'Heuristic (no AI key)'}</span></div>
+          </div>
+
+          {data.recommendations.length === 0 && <p className="text-xs text-slate-400">No recommendations returned for this scope.</p>}
+          <div className="space-y-2">
+            {data.recommendations.map((r, i) => (
+              <div key={i} className="rounded-lg border border-slate-200 bg-white p-3 text-xs shadow-sm">
+                <div className="flex items-baseline justify-between gap-2">
+                  <div className="font-semibold text-slate-800">{r.kind} · {formatAmount(r)}</div>
+                  <span className={`fd-pill ${confTone(r.confidence)}`}>{r.confidence}</span>
+                </div>
+                <div className="mt-0.5 text-[11px] text-slate-500">{r.scopeNote} · effective {r.effectiveDate}</div>
+                <p className="mt-1.5 leading-relaxed text-slate-600">{r.rationale}</p>
+                <button onClick={() => onApplyDraft({ changeType: r.changeType, amount: r.amount, effectiveDate: r.effectiveDate })} className="fd-btn fd-btn-primary mt-2 h-8 px-3 text-xs">Apply to form</button>
+              </div>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );
