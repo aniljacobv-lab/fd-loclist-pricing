@@ -59,7 +59,13 @@ export default function App() {
     <div className="flex h-full" style={{ background: 'var(--app-bg)' }}>
       <aside className="relative flex w-60 shrink-0 flex-col border-r border-slate-200" style={{ background: 'var(--sidebar-bg)', color: 'var(--sidebar-fg)' }}>
         <div className="flex items-center gap-2.5 px-5 py-5">
-          <span className="grid h-9 w-9 place-items-center rounded-lg text-sm font-bold shadow-sm" style={{ background: 'var(--logo-bg)', color: 'var(--logo-fg)' }}>{theme.initials}</span>
+          {theme.logoUrl ? (
+            <span className="grid h-9 w-9 shrink-0 overflow-hidden place-items-center rounded-lg bg-white shadow-sm" style={{ borderColor: 'var(--border)' }}>
+              <img src={theme.logoUrl} alt={theme.companyName} className="h-9 w-9 object-contain" />
+            </span>
+          ) : (
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-sm font-bold shadow-sm" style={{ background: 'var(--logo-bg)', color: 'var(--logo-fg)' }}>{theme.initials}</span>
+          )}
           <div className="leading-tight">
             <div className="text-sm font-semibold" style={{ color: 'var(--sidebar-fg)' }}>{theme.companyName}</div>
             <div className="text-[11px]" style={{ color: 'var(--sidebar-fg-muted)' }}>{theme.tagline}</div>

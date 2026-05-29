@@ -16,6 +16,7 @@ export interface Theme {
   sidebarBg: string;           // sidebar background
   logoBg?: string;             // optional override; defaults to primary
   logoFg?: string;             // optional override; defaults to white
+  logoUrl?: string;            // optional image (data URL or remote URL) — overrides initials when set
 }
 
 // Tinted utility — produces an rgba() with the requested alpha from a #RRGGBB.
@@ -57,6 +58,7 @@ export interface ThemeOverrides {
   primaryHover?: string;
   appBg?: string;
   sidebarBg?: string;
+  logoUrl?: string | null;
 }
 
 const STORAGE_KEY = 'fd.theme';
@@ -83,6 +85,7 @@ export function resolveTheme(overrides: ThemeOverrides = readStored()): Theme {
     primaryHover: overrides.primaryHover ?? base.primaryHover,
     appBg: overrides.appBg ?? base.appBg,
     sidebarBg: overrides.sidebarBg ?? base.sidebarBg,
+    logoUrl: overrides.logoUrl === null ? undefined : (overrides.logoUrl ?? base.logoUrl),
   };
 }
 

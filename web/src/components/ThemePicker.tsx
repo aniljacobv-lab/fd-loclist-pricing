@@ -12,6 +12,7 @@ export function ThemePicker({ onClose }: Props) {
   const [initials, setInitials] = useState(init.theme.initials);
   const [tagline, setTagline] = useState(init.theme.tagline);
   const [primary, setPrimary] = useState<string>(init.theme.primary);
+  const [logoUrl, setLogoUrl] = useState<string | undefined>(init.theme.logoUrl);
   const ref = useRef<HTMLDivElement | null>(null);
 
   // Outside-click close
@@ -28,15 +29,15 @@ export function ThemePicker({ onClose }: Props) {
   }, [onClose]);
 
   // Preview-as-you-type: apply the current draft so the sidebar updates live.
-  useEffect(() => { themeApi.set(draft()); /* eslint-disable-next-line */ }, [baseId, companyName, initials, tagline, primary]);
+  useEffect(() => { themeApi.set(draft()); /* eslint-disable-next-line */ }, [baseId, companyName, initials, tagline, primary, logoUrl]);
 
   function draft(): ThemeOverrides {
-    return { baseId, companyName, initials: initials.slice(0, 3).toUpperCase(), tagline, primary, primaryHover: darker(primary, 0.14) };
+    return { baseId, companyName, initials: initials.slice(0, 3).toUpperCase(), tagline, primary, primaryHover: darker(primary, 0.14), logoUrl: logoUrl ?? null };
   }
   function pickBase(t: Theme) {
     setBaseId(t.id);
     // Reset overrides to the base theme's defaults so the swatch click feels clean.
-    setCompanyName(t.companyName); setInitials(t.initials); setTagline(t.tagline); setPrimary(t.primary);
+    setCompanyName(t.companyName); setInitials(t.initials); setTagline(t.tagline); setPrimary(t.primary); setLogoUrl(t.logoUrl);
   }
 
   return (
@@ -74,6 +75,43 @@ export function ThemePicker({ onClose }: Props) {
         <div>
           <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Tagline</div>
           <input className="fd-input text-sm" value={tagline} onChange={(e) => setTagline(e.target.value)} />
+        </div>
+
+        <div>
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Logo image</span>
+            {logoUrl && <button onClick={() => setLogoUrl(undefined)} className="text-[10px] text-slate-400 hover:text-red-600">Remove</button>}
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-md border border-slate-200 bg-slate-50">
+              {logoUrl ? <img src={logoUrl} alt="logo" className="h-10 w-10 object-contain" /> : <span className="text-[10px] font-semibold text-slate-400">{initials || 'LOGO'}</span>}
+            </div>
+            <div className="min-w-0 flex-1 space-y-1.5">
+              <label className="fd-btn fd-btn-ghost h-8 cursor-pointer text-xs">
+                Upload image
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/svg+xml,image/webp"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (!f) return;
+                    const reader = new FileReader();
+                    reader.onload = () => { if (typeof reader.result === 'string') setLogoUrl(reader.result); };
+                    reader.readAsDataURL(f);
+                    e.currentTarget.value = '';
+                  }}
+                />
+              </label>
+              <input
+                className="fd-input h-8 text-[11px]"
+                placeholder="…or paste image URL"
+                value={logoUrl && !logoUrl.startsWith('data:') ? logoUrl : ''}
+                onChange={(e) => setLogoUrl(e.target.value || undefined)}
+              />
+            </div>
+          </div>
+          <p className="mt-1 text-[10px] text-slate-400">PNG/SVG/JPG. Uploaded files are stored locally in your browser (no upload to a server).</p>
         </div>
 
         <div>
