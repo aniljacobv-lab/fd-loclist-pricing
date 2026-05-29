@@ -20,7 +20,6 @@ import { dashboardRoutes } from './routes/dashboard.js';
 import { markdownRoutes } from './routes/markdowns.js';
 import { competitorRoutes } from './routes/competitors.js';
 import { pennyMarkdownRoutes } from './routes/pennyMarkdown.js';
-import { vectorRoutes } from './routes/vector.js';
 import { anthropicConfigured, resetAnthropic } from './ai/client.js';
 
 // Re-parse .env into process.env without a restart, then reset the AI client.
@@ -87,7 +86,6 @@ async function main() {
     await markdownRoutes(api, ds);
     await competitorRoutes(api, ds);
     await pennyMarkdownRoutes(api, ds);
-    await vectorRoutes(api, ds);
     // /api/health convenience mirror for clients that prefix everything.
     api.get('/health', async () => ({ ok: true, datastore: config.datastore, anthropicConfigured: anthropicConfigured() }));
   }, { prefix: '/api' });

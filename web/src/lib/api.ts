@@ -192,6 +192,18 @@ export interface PennyMarkdownGenerateResponse {
   warning: string;
 }
 
+// ----- vector DB -----
+export interface VectorStatus {
+  activeProvider: string;
+  providerDimensions: number;
+  items: { rows: number; dim: number; provider: string; lastUpdated: string | null };
+  priceChanges: { rows: number; dim: number; provider: string; lastUpdated: string | null };
+}
+export interface VectorItemHit { sku: number; similarity: number; description: string | null; deptName: string | null; vendorName: string | null; currentRetail: number | null; }
+export interface VectorItemSearchResponse { provider: string; query?: string; seed?: { sku: number; item: Item | null }; hits: VectorItemHit[]; }
+export interface VectorPcHit { pcId: number; similarity: number; pcName: string | null; status: PCStatus | null; changeType: ChangeType | null; amount: number | null; effectiveDate: string | null; skuCount: number; storeCount: number; }
+export interface VectorPcSimilarResponse { provider: string; seed: { pcId: number; pcName: string | null }; hits: VectorPcHit[]; }
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // Only declare a JSON content-type when we're actually sending a body.
   // Otherwise Fastify rejects empty-body POSTs with FST_ERR_CTP_EMPTY_JSON_BODY
@@ -319,6 +331,30 @@ export const api = {
   },
   pennyGenerate: (body: { skus: number[]; notes?: string | null; effectiveDate?: string | null }) =>
     req<PennyMarkdownGenerateResponse>('/penny-markdown/generate', { method: 'POST', body: JSON.stringify(body) }),
+
+  // Vector DB (semantic search + similarity)
+  vectorStatus: () => req<VectorStatus>('/vector/status'),
+  indexItems: () => req<{ rows: number; provider: string; dim: number }>('/vector/items/index', { method: 'POST' }),
+  indexPriceChanges: () => req<{ rows: number; provider: string; dim: number }>('/vector/price-changes/index', { method: 'POST' }),
+  similarItems: (params: { sku: number; k?: number; deptId?: number | null; excludeSelf?: boolean }) => {
+    const q = new URLSearchParams(); q.set('sku', String(params.sku));
+    if (params.k != null) q.set('k', String(params.k));
+    if (params.deptId != null) q.set('deptId', String(params.deptId));
+    if (params.excludeSelf != null) q.set('excludeSelf', String(params.excludeSelf));
+    return req<VectorItemSearchResponse>(`/vector/items/similar?${q.toString()}`);
+  },
+  searchItemsSemantic: (params: { q: string; k?: number; deptId?: number | null }) => {
+    const qs = new URLSearchParams(); qs.set('q', params.q);
+    if (params.k != null) qs.set('k', String(params.k));
+    if (params.deptId != null) qs.set('deptId', String(params.deptId));
+    return req<VectorItemSearchResponse>(`/vector/items/search?${qs.toString()}`);
+  },
+  similarPriceChanges: (params: { pcId: number; k?: number; excludeSelf?: boolean }) => {
+    const q = new URLSearchParams(); q.set('pcId', String(params.pcId));
+    if (params.k != null) q.set('k', String(params.k));
+    if (params.excludeSelf != null) q.set('excludeSelf', String(params.excludeSelf));
+    return req<VectorPcSimilarResponse>(`/vector/price-changes/similar?${q.toString()}`);
+  },
 
   aiGroupStores: (body: { numClusters: number; hint?: string; storeIds?: number[] }) => req<{ clusters: Array<{ name: string; rationale: string; storeIds: number[] }>; stub?: boolean }>('/ai/group-stores', { method: 'POST', body: JSON.stringify(body) }),
   aiSuggestPrice: (body: { sku: number; reasonCode?: number | null; sellThrough?: number | null; weeksOnHand?: number | null }) => req<{ changeType: ChangeType; amount: number; rationale: string }>('/ai/suggest-price', { method: 'POST', body: JSON.stringify(body) }),

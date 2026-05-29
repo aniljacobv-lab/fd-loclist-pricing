@@ -34,6 +34,18 @@ type CatalogGroup = { dept: number; deptName: string; cls: number; className: st
 
 export class MemoryStore implements DataStore {
   private items: Item[] = [];
+  // ---- secondary indices (rebuilt after every items load) ----
+  // O(1) sku lookup. Replaces the O(n) find used by getItem(), which is hit
+  // hundreds of times per impact/markdown/penny request.
+  private itemsBySku = new Map<number, Item>();
+  // Dept/class/subclass/vendor → SKUs[]. resolveItems() starts from the
+  // smallest matching base set so a filtered query only scans a few hundred
+  // items instead of the whole 18k+ catalog.
+  private itemsByDept = new Map<number, Item[]>();
+  private itemsByClass = new Map<string, Item[]>();     // key: `${dept}:${classId}`
+  private itemsBySubclass = new Map<string, Item[]>();  // key: `${dept}:${cls}:${sub}`
+  private itemsByVendor = new Map<number, Item[]>();
+
   private stores: Store[] = [];
   private zoneGroups: ZoneGroup[] = [];
   private rawZones: RawZone[] = [];
@@ -67,7 +79,7 @@ export class MemoryStore implements DataStore {
     const s = search.toLowerCase();
     return this.items.filter((i) => String(i.sku).includes(s) || i.description.toLowerCase().includes(s));
   }
-  async getItem(sku: number): Promise<Item | null> { return this.items.find((i) => i.sku === sku) ?? null; }
+  async getItem(sku: number): Promise<Item | null> { return this.itemsBySku.get(sku) ?? null; }
 
   async submitForApproval(id: number, actor: string, requiredTier: number): Promise<PriceChange | null> {
     const pc = this.priceChanges.find((p) => p.pcId === id); if (!pc) return null;
@@ -139,7 +151,23 @@ export class MemoryStore implements DataStore {
       const set = new Set(base);
       candidates = this.items.filter((i) => set.has(i.sku));
     } else {
-      candidates = this.items; // ALL / HIERARCHY / PRICE_POINT / VENDOR → whole catalog, refined below
+      // INDEXED FAST PATH: pick the smallest available base set so we don't
+      // scan the whole catalog when a hierarchy/vendor filter is on.
+      const dArr = sel.deptIds?.length ? sel.deptIds : (sel.deptId != null ? [sel.deptId] : []);
+      const cArr = sel.classIds?.length ? sel.classIds : (sel.classId != null ? [sel.classId] : []);
+      const sArr = sel.subclassIds?.length ? sel.subclassIds : (sel.subclassId != null ? [sel.subclassId] : []);
+      const vArr = sel.vendorIds?.length ? sel.vendorIds : (sel.vendorId != null ? [sel.vendorId] : []);
+      const bases: Item[][] = [];
+      if (sArr.length && dArr.length && cArr.length) {
+        for (const d of dArr) for (const c of cArr) for (const su of sArr) { const b = this.itemsBySubclass.get(`${d}:${c}:${su}`); if (b) bases.push(b); }
+      } else if (cArr.length && dArr.length) {
+        for (const d of dArr) for (const c of cArr) { const b = this.itemsByClass.get(`${d}:${c}`); if (b) bases.push(b); }
+      } else if (dArr.length) {
+        for (const d of dArr) { const b = this.itemsByDept.get(d); if (b) bases.push(b); }
+      } else if (vArr.length) {
+        for (const v of vArr) { const b = this.itemsByVendor.get(v); if (b) bases.push(b); }
+      }
+      candidates = bases.length ? ([] as Item[]).concat(...bases) : this.items;
     }
     // 2) predicate filters — ANDed across types; OR within a multi-value filter
     const pick = (arr?: number[], single?: number | null): Set<number> | null => {
@@ -231,6 +259,36 @@ export class MemoryStore implements DataStore {
   }
   async updatePriceChangeStatus(id: number, status: PCStatus): Promise<PriceChange | null> { const pc = this.priceChanges.find((p) => p.pcId === id); if (!pc) return null; pc.status = status; return this.clonePc(pc); }
   private clonePc(pc: PriceChange): PriceChange { return { ...pc, itemSelector: { ...pc.itemSelector }, locationSelector: { ...pc.locationSelector }, resolvedSkus: [...pc.resolvedSkus], resolvedStoreIds: [...pc.resolvedStoreIds], priceMap: pc.priceMap ? pc.priceMap.map((m) => ({ ...m })) : pc.priceMap, rezone: pc.rezone ? { ...pc.rezone } : pc.rezone, approvedTiers: [...pc.approvedTiers], approvalLog: pc.approvalLog.map((e) => ({ ...e })) }; }
+
+  /** Rebuilds all secondary item indices. O(n). Call after this.items is replaced. */
+  private rebuildItemIndices(): void {
+    this.itemsBySku.clear();
+    this.itemsByDept.clear();
+    this.itemsByClass.clear();
+    this.itemsBySubclass.clear();
+    this.itemsByVendor.clear();
+    for (const it of this.items) {
+      this.itemsBySku.set(it.sku, it);
+      if (it.deptId != null) {
+        let bucket = this.itemsByDept.get(it.deptId); if (!bucket) { bucket = []; this.itemsByDept.set(it.deptId, bucket); }
+        bucket.push(it);
+        if (it.classId != null) {
+          const k = `${it.deptId}:${it.classId}`;
+          let cb = this.itemsByClass.get(k); if (!cb) { cb = []; this.itemsByClass.set(k, cb); }
+          cb.push(it);
+          if (it.subclassId != null) {
+            const sk = `${it.deptId}:${it.classId}:${it.subclassId}`;
+            let sb = this.itemsBySubclass.get(sk); if (!sb) { sb = []; this.itemsBySubclass.set(sk, sb); }
+            sb.push(it);
+          }
+        }
+      }
+      if (it.vendorId != null) {
+        let vb = this.itemsByVendor.get(it.vendorId); if (!vb) { vb = []; this.itemsByVendor.set(it.vendorId, vb); }
+        vb.push(it);
+      }
+    }
+  }
 
   async listCalendarActivities(range?: { from?: string; to?: string }, scope?: CalendarScope): Promise<CalendarActivity[]> {
     const zg = scope?.zoneGroupId ?? null; const zid = scope?.zoneId ?? null; const scoped = zg != null || zid != null;
@@ -386,6 +444,7 @@ export class MemoryStore implements DataStore {
       const cost = retail != null ? Math.round(retail * 0.62 * 100) / 100 : null;  // est. cost from retail
       return { sku: it.sku, description: it.desc, deptId: it.dept, classId: it.cls, subclassId: it.sub, vendorId: v?.vendorId ?? null, vendorName: v?.vendorName ?? null, isDSD: v?.isDSD ?? false, cost, currentRetail: retail, priceSource: it.priceSource, promoPrice: it.promoPrice ?? null, promoLabel: it.promoLabel ?? null, promoMultiQty: it.promoMultiQty ?? null, promoMultiPrice: it.promoMultiPrice ?? null };
     });
+    this.rebuildItemIndices();
     // item counts per node + roll-ups to group/division
     for (const it of this.items) {
       if (it.deptId == null) continue;

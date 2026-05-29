@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { api, type ChangeType } from '../lib/api';
+import { api, type ChangeType, type VectorStatus } from '../lib/api';
+import { SimilarItems } from './SimilarItems';
 
 interface Props {
   sku: number | null;
@@ -14,7 +15,20 @@ interface Props {
 }
 
 export function AIAssistPanel({ sku, onApplyDraft }: Props) {
-  const [tab, setTab] = useState<'nl' | 'group' | 'suggest'>('nl');
+  const [tab, setTab] = useState<'nl' | 'group' | 'suggest' | 'find'>('nl');
+  const [findQuery, setFindQuery] = useState('');
+  const [vectorStatus, setVectorStatus] = useState<VectorStatus | null>(null);
+  const [vectorBusy, setVectorBusy] = useState(false);
+  async function refreshVectorStatus() {
+    try { setVectorStatus(await api.vectorStatus()); } catch { setVectorStatus(null); }
+  }
+  async function rebuildItemIndex() {
+    setVectorBusy(true);
+    try { await api.indexItems(); await refreshVectorStatus(); }
+    catch (e: any) { alert('Index build failed: ' + (e?.message ?? e)); }
+    finally { setVectorBusy(false); }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <div className="mb-3 flex items-center gap-2">
@@ -25,7 +39,7 @@ export function AIAssistPanel({ sku, onApplyDraft }: Props) {
       </div>
 
       <div className="mb-3 fd-seg">
-        {([['nl','Describe'],['group','Group'],['suggest','Suggest']] as const).map(([k,l]) => (
+        {([['nl','Describe'],['group','Group'],['suggest','Suggest'],['find','Find']] as const).map(([k,l]) => (
           <button key={k} onClick={() => setTab(k)} className={`fd-seg-item ${tab === k ? 'fd-seg-item-active' : ''}`}>{l}</button>
         ))}
       </div>
@@ -33,6 +47,44 @@ export function AIAssistPanel({ sku, onApplyDraft }: Props) {
       {tab === 'nl' && <NLPanel onApplyDraft={onApplyDraft} />}
       {tab === 'group' && <GroupPanel onApplyDraft={onApplyDraft} />}
       {tab === 'suggest' && <SuggestPanel sku={sku} onApplyDraft={onApplyDraft} />}
+
+      {tab === 'find' && (
+        <div className="space-y-3">
+          <p className="text-[11px] text-slate-500">Semantic catalog search powered by the vector index. Works on item meaning, not just substring match.</p>
+          <div>
+            <input
+              className="fd-input text-sm"
+              placeholder="e.g. tortilla chips, baby wipes, dog food"
+              value={findQuery}
+              onChange={(e) => setFindQuery(e.target.value)}
+            />
+          </div>
+          {findQuery.trim().length >= 2 && (
+            <SimilarItems query={findQuery} k={8} title="Top matches" />
+          )}
+          {sku != null && findQuery.trim().length < 2 && (
+            <SimilarItems sku={sku} k={8} title={`Items similar to SKU ${sku}`} />
+          )}
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-[11px] text-slate-600">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="font-medium text-slate-700">Vector index</span>
+              <button onClick={refreshVectorStatus} className="text-slate-400 hover:text-slate-700">Refresh</button>
+            </div>
+            {vectorStatus ? (
+              <div className="space-y-0.5 text-slate-500">
+                <div>Provider: <span className="font-medium text-slate-700">{vectorStatus.activeProvider}</span> ({vectorStatus.providerDimensions}d)</div>
+                <div>Items: {vectorStatus.items.rows.toLocaleString()} rows · dim {vectorStatus.items.dim}</div>
+                <div>Price changes: {vectorStatus.priceChanges.rows.toLocaleString()} rows · dim {vectorStatus.priceChanges.dim}</div>
+                {vectorStatus.items.lastUpdated && <div className="text-[10px] text-slate-400">last built {new Date(vectorStatus.items.lastUpdated).toLocaleString()}</div>}
+              </div>
+            ) : (
+              <button onClick={refreshVectorStatus} className="text-fd-red hover:underline">Check status</button>
+            )}
+            <button onClick={rebuildItemIndex} disabled={vectorBusy} className="fd-btn fd-btn-ghost mt-2 h-7 text-[11px]">{vectorBusy ? 'Rebuilding…' : 'Rebuild item index'}</button>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

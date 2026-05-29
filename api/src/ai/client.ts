@@ -1,5 +1,11 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { createHash } from 'node:crypto';
 import { config } from '../config.js';
+import { LRU } from '../lib/lru.js';
+
+// AI-call cache. Identical (system + user + jsonShape + model) prompts return
+// the cached JSON instantly. Keyed by sha256 hex of the request payload.
+const askJsonCache = new LRU<string, unknown>(256);
 
 let client: Anthropic | null = null;
 let cachedKey: string | null = null;
@@ -28,6 +34,9 @@ export function anthropicConfigured(): boolean { return Boolean(currentKey()); }
 export async function askJson<T>(opts: { system: string; user: string; jsonShape: string; maxTokens?: number }): Promise<T | null> {
   const a = getAnthropic();
   if (!a) return null;
+  const cacheKey = createHash('sha256').update(currentModel() + '|' + opts.system + '|' + opts.user + '|' + opts.jsonShape).digest('hex');
+  const cached = askJsonCache.get(cacheKey);
+  if (cached !== undefined) return cached as T;
   const msg = await a.messages.create({
     model: currentModel(),
     max_tokens: opts.maxTokens ?? 1024,
@@ -37,5 +46,5 @@ export async function askJson<T>(opts: { system: string; user: string; jsonShape
   const text = msg.content.filter((b): b is Anthropic.TextBlock => b.type === 'text').map((b) => b.text).join('');
   const a0 = text.indexOf('{'), b0 = text.lastIndexOf('}');
   if (a0 < 0 || b0 < 0) return null;
-  try { return JSON.parse(text.slice(a0, b0 + 1)) as T; } catch { return null; }
+  try { const parsed = JSON.parse(text.slice(a0, b0 + 1)) as T; askJsonCache.set(cacheKey, parsed); return parsed; } catch { return null; }
 }
