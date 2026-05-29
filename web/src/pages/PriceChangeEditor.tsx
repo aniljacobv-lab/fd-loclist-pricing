@@ -102,23 +102,28 @@ export function PriceChangeEditor({ pcId, onClose }: Props) {
   return (
     <div className="flex h-full">
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center justify-between border-b border-slate-200 bg-white px-8 py-4">
-          <div className="min-w-0">
-            <button onClick={onClose} className="mb-1 text-xs font-medium text-slate-400 hover:text-slate-700">&larr; Back to Price Changes</button>
-            <input className="block w-[36rem] max-w-full rounded-md border border-transparent bg-transparent text-xl font-semibold text-slate-900 outline-none hover:border-slate-200 focus:border-fd-red focus:px-2" value={pcName} onChange={(e) => setPcName(e.target.value)} />
-            <p className="mt-1 flex items-center gap-2 text-xs text-slate-500">
-              <span className={`fd-pill ${existing ? 'bg-slate-100 text-slate-600' : 'bg-amber-50 text-amber-700'}`}>{existing?.status ?? 'NEW'}</span>
-              {existing && <span>PC #{existing.pcId} · {existing.resolvedSkus.length} SKUs × {existing.resolvedStoreIds.length} stores</span>}
-              {exec && <span className="text-slate-400">· {exec}</span>}
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={save} disabled={saving} className="fd-btn fd-btn-ghost">{existing ? 'Save new version' : 'Save draft'}</button>
-            {existing && <button onClick={reResolve} className="fd-btn fd-btn-ghost">Resolve</button>}
-            {existing?.status === 'WORKSHEET' && <button onClick={submit} className="fd-btn fd-btn-primary">Submit for approval</button>}
-            
-            {existing?.status === 'APPROVED' && <button onClick={promote} className="fd-btn fd-btn-primary">Promote to RMS</button>}
-            {!existing && <button disabled className="fd-btn fd-btn-primary opacity-50">Submit</button>}
+        <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/95 px-8 py-4 backdrop-blur">
+          <button onClick={onClose} className="mb-2 inline-flex items-center text-[11px] font-medium uppercase tracking-wide text-slate-400 hover:text-slate-700">&larr;&nbsp;Back to Price Changes</button>
+          <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+            <div className="min-w-0 flex-1">
+              <input
+                className="block w-full rounded-md border border-transparent bg-transparent text-xl font-semibold leading-7 tracking-tight text-slate-900 outline-none transition hover:border-slate-200 focus:border-brand focus:px-2"
+                value={pcName}
+                onChange={(e) => setPcName(e.target.value)}
+              />
+              <p className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+                <span className={`fd-pill ${existing ? 'bg-slate-100 text-slate-600' : 'bg-amber-50 text-amber-700'}`}>{existing?.status ?? 'NEW'}</span>
+                {existing && <span>PC #{existing.pcId} · {existing.resolvedSkus.length.toLocaleString()} SKUs × {existing.resolvedStoreIds.length.toLocaleString()} stores</span>}
+                {exec && <span className="text-slate-400">· {exec}</span>}
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button onClick={save} disabled={saving} className="fd-btn fd-btn-ghost">{existing ? 'Save new version' : 'Save draft'}</button>
+              {existing && <button onClick={reResolve} className="fd-btn fd-btn-ghost">Resolve</button>}
+              {existing?.status === 'WORKSHEET' && <button onClick={submit} className="fd-btn fd-btn-primary">Submit for approval</button>}
+              {existing?.status === 'APPROVED' && <button onClick={promote} className="fd-btn fd-btn-primary">Promote to RMS</button>}
+              {!existing && <button disabled className="fd-btn fd-btn-primary opacity-50">Submit</button>}
+            </div>
           </div>
         </header>
 
