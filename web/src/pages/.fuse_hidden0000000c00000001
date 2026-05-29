@@ -247,7 +247,7 @@ export function PriceChangeEditor({ pcId, onClose }: Props) {
 
       <aside className="w-80 shrink-0 border-l border-slate-200 bg-white p-5">
         <AIAssistPanel
-          sku={itemSel.sku ?? (itemSel.skus && itemSel.skus.length === 1 ? (itemSel.skus[0] ?? null) : null)}
+          sku={itemSel.sku ?? null}
           onApplyDraft={(d) => {
             if (d.pcName !== undefined) setPcName(d.pcName);
             if (d.sku !== undefined && d.sku !== null) setItemSel({ mode: 'SINGLE_SKU', sku: d.sku, exceptSkus: [] });
