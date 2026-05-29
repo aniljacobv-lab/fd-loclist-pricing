@@ -193,7 +193,16 @@ export interface PennyMarkdownGenerateResponse {
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', 'X-User': auth.user(), 'X-Role': auth.role(), ...(init?.headers ?? {}) }, ...init });
+  // Only declare a JSON content-type when we're actually sending a body.
+  // Otherwise Fastify rejects empty-body POSTs with FST_ERR_CTP_EMPTY_JSON_BODY
+  // (affects the submit/approve/reject/resolve/promote endpoints).
+  const headers: Record<string, string> = {
+    'X-User': auth.user(),
+    'X-Role': auth.role(),
+    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+  };
+  if (init?.body != null) headers['Content-Type'] = 'application/json';
+  const r = await fetch(`/api${path}`, { ...init, headers });
   if (!r.ok) { const text = await r.text(); throw new Error(`${r.status} ${r.statusText}: ${text}`); }
   return r.json() as Promise<T>;
 }
