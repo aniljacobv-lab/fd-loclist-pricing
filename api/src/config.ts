@@ -35,10 +35,20 @@ export interface MarkdownConfig {
 export interface CompetitorRival { key: string; name: string; searchUrl: string; }
 export interface CompetitorsConfig { rivals: CompetitorRival[]; fetchTimeoutMs: number; scrapeBatchCap: number; }
 
+export interface PennyMarkdownConfig {
+  extremeSellThroughPct: number;
+  extremeWeeksOnHandMin: number;
+  pennyPrice: number;
+  storeCoveragePct: number;
+  aiSampleCap: number;
+  rationaleTemplates: string[];
+}
+
 export interface AppConfig {
   pricing: { marginFloorPct: number; assumedElasticity: number; projectionWeeks: number; defaultRoundingRule: string; endsInOptions: number[]; pricePointOptions: number[] };
   approvals: ApprovalsConfig;
   markdowns: MarkdownConfig;
+  pennyMarkdown: PennyMarkdownConfig;
   competitors: CompetitorsConfig;
   leadTimes: Record<ActivityType, number>;
   pagination: { defaultPageSize: number; maxPageSize: number };
@@ -76,6 +86,17 @@ const DEFAULTS: AppConfig = {
     ],
   },
   markdowns: { slowSellThroughPct: 50, slowWeeksOnHandMin: 20, schedule: [{ stepNo: 1, markdownPct: 25, afterDays: 0 }, { stepNo: 2, markdownPct: 50, afterDays: 14 }, { stepNo: 3, markdownPct: 75, afterDays: 28 }] },
+  pennyMarkdown: {
+    extremeSellThroughPct: 10, extremeWeeksOnHandMin: 52, pennyPrice: 0.01, storeCoveragePct: 25, aiSampleCap: 30,
+    rationaleTemplates: [
+      'Vendor discontinued — no replenishment',
+      'Seasonal item held past season (12+ months)',
+      'Test SKU failed velocity targets',
+      'Display/damaged unit, unsellable',
+      'Obsolete pack/variant, replaced by newer SKU',
+      'Recall residual / hazmat — destruction required',
+    ],
+  },
   competitors: {
     rivals: [
       { key: 'DG', name: 'Dollar General', searchUrl: 'https://www.dollargeneral.com/search?q={q}' },
@@ -98,6 +119,7 @@ function loadAppConfig(): AppConfig {
       pricing: { ...DEFAULTS.pricing, ...raw.pricing },
       approvals: { ...DEFAULTS.approvals, ...(raw.approvals ?? {}) },
       markdowns: { ...DEFAULTS.markdowns, ...(raw.markdowns ?? {}) },
+      pennyMarkdown: { ...DEFAULTS.pennyMarkdown, ...(raw.pennyMarkdown ?? {}) },
       competitors: { ...DEFAULTS.competitors, ...(raw.competitors ?? {}) },
       ai: { ...DEFAULTS.ai, ...raw.ai },
       pagination: { ...DEFAULTS.pagination, ...raw.pagination },

@@ -172,6 +172,26 @@ export interface ScrapeResponse { scraped: number; requested: number; capped: bo
 export interface GapLine { sku: number; description: string; deptName: string; fdPrice: number; competitors: { rivalKey: string; rivalName: string; price: number }[]; avgCompetitor: number; gapPct: number; action: string; }
 export interface GapReport { totalCovered: number; lines: GapLine[]; }
 
+// ----- penny markdown (destruction) -----
+export interface PennyCandidate {
+  sku: number; description: string; deptName: string;
+  currentRetail: number; cost: number | null;
+  sellThroughPct: number; weeksOnHand: number; inventoryUnitsPerStore: number;
+  rationale: string; severity: number; source: 'AI' | 'HEURISTIC';
+}
+export interface PennyMarkdownResponse {
+  simulated: boolean; note: string;
+  scope: { kind: string; deptId: number | null };
+  thresholds: { extremeSellThroughPct: number; extremeWeeksOnHandMin: number; pennyPrice: number };
+  totalCandidates: number; aiUsed: boolean;
+  recommendations: PennyCandidate[];
+}
+export interface PennyMarkdownGenerateResponse {
+  pennyPrice: number;
+  skuList: SkuList; locList: LocationList; priceChange: PriceChange;
+  warning: string;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', 'X-User': auth.user(), 'X-Role': auth.role(), ...(init?.headers ?? {}) }, ...init });
   if (!r.ok) { const text = await r.text(); throw new Error(`${r.status} ${r.statusText}: ${text}`); }
@@ -279,6 +299,17 @@ export const api = {
     if (params.limit != null) q.set('limit', String(params.limit));
     return req<GapReport>(`/competitors/gap-report?${q.toString()}`);
   },
+
+  // Penny markdown (destruction)
+  pennyRecs: (params: { kind?: 'ALL' | 'DEPT'; deptId?: number | null; useAi?: boolean; limit?: number } = {}) => {
+    const q = new URLSearchParams(); q.set('kind', params.kind ?? 'ALL');
+    if (params.deptId != null) q.set('deptId', String(params.deptId));
+    if (params.useAi != null) q.set('useAi', String(params.useAi));
+    if (params.limit != null) q.set('limit', String(params.limit));
+    return req<PennyMarkdownResponse>(`/penny-markdown/recommendations?${q.toString()}`);
+  },
+  pennyGenerate: (body: { skus: number[]; notes?: string | null; effectiveDate?: string | null }) =>
+    req<PennyMarkdownGenerateResponse>('/penny-markdown/generate', { method: 'POST', body: JSON.stringify(body) }),
 
   aiGroupStores: (body: { numClusters: number; hint?: string; storeIds?: number[] }) => req<{ clusters: Array<{ name: string; rationale: string; storeIds: number[] }>; stub?: boolean }>('/ai/group-stores', { method: 'POST', body: JSON.stringify(body) }),
   aiSuggestPrice: (body: { sku: number; reasonCode?: number | null; sellThrough?: number | null; weeksOnHand?: number | null }) => req<{ changeType: ChangeType; amount: number; rationale: string }>('/ai/suggest-price', { method: 'POST', body: JSON.stringify(body) }),

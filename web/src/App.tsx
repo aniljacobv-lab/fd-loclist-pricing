@@ -10,6 +10,7 @@ import { RezonePage } from './pages/RezonePage';
 import { DashboardPage } from './pages/DashboardPage';
 import { MarkdownsPage } from './pages/MarkdownsPage';
 import { CompetitorsPage } from './pages/CompetitorsPage';
+import { PennyMarkdownPage } from './pages/PennyMarkdownPage';
 
 type View =
   | { kind: 'home' }
@@ -21,6 +22,7 @@ type View =
   | { kind: 'storeview' }
   | { kind: 'rezone' }
   | { kind: 'markdowns' }
+  | { kind: 'penny' }
   | { kind: 'competitors' };
 
 function NavItem({ active, onClick, label, icon }: { active: boolean; onClick: () => void; label: string; icon: JSX.Element }) {
@@ -40,6 +42,7 @@ const TreeIcon = (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" st
 const HomeIcon = (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>);
 const MarkIcon = (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="14 7 21 7 21 14"/></svg>);
 const CompIcon = (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>);
+const PennyIcon = (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9 9h4a2 2 0 0 1 0 4H9"/><line x1="9" y1="13" x2="13" y2="13"/><line x1="9" y1="9" x2="9" y2="16"/></svg>);
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: 'home' });
@@ -67,6 +70,7 @@ export default function App() {
           <NavItem active={view.kind === 'calendar'} onClick={() => setView({ kind: 'calendar' })} label="Calendar" icon={CalIcon} />
           <NavItem active={view.kind === 'markdowns'} onClick={() => setView({ kind: 'markdowns' })} label="Markdowns" icon={MarkIcon} />
           <NavItem active={view.kind === 'competitors'} onClick={() => setView({ kind: 'competitors' })} label="Competitors" icon={CompIcon} />
+          <NavItem active={view.kind === 'penny'} onClick={() => setView({ kind: 'penny' })} label="Penny markdown" icon={PennyIcon} />
         </nav>
         <div className="space-y-2 border-t border-slate-100 p-4 text-xs">
           <div>
@@ -100,6 +104,7 @@ export default function App() {
           {view.kind === 'calendar' && <CalendarPage />}
           {view.kind === 'markdowns' && <MarkdownsPage onOpen={(pcId) => setView({ kind: 'edit', pcId })} />}
           {view.kind === 'competitors' && <CompetitorsPage />}
+          {view.kind === 'penny' && <PennyMarkdownPage onOpen={(pcId) => setView({ kind: 'edit', pcId })} />}
         </main>
       </div>
     </div>

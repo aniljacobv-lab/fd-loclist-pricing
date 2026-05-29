@@ -19,6 +19,22 @@
       { "stepNo": 3, "markdownPct": 75, "afterDays": 28 }
     ]
   },
+  "pennyMarkdown": {
+    "$comment": "Penny markdown ($0.01) = remove from shelf + destroy. Far stricter thresholds than the regular cadence; triggers VP approval automatically via the impact engine because cost > retail on every item.",
+    "extremeSellThroughPct": 10,
+    "extremeWeeksOnHandMin": 52,
+    "pennyPrice": 0.01,
+    "storeCoveragePct": 25,
+    "aiSampleCap": 30,
+    "rationaleTemplates": [
+      "Vendor discontinued — no replenishment",
+      "Seasonal item held past season (12+ months)",
+      "Test SKU failed velocity targets",
+      "Display/damaged unit, unsellable",
+      "Obsolete pack/variant, replaced by newer SKU",
+      "Recall residual / hazmat — destruction required"
+    ]
+  },
   "competitors": {
     "$comment": "Live web scraping of competitor sites. Search URL templates use {q} for the URL-encoded item description.",
     "rivals": [
