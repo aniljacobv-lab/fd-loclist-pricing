@@ -344,6 +344,10 @@ export const api = {
     req<{ skuList: SkuList; priceChanges: PriceChange[] }>('/markdown/generate', { method: 'POST', body: JSON.stringify(body) }),
 
   // Competitors
+  // extra competitor data-paths
+  uploadCompetitorCsv: (csv: string) => req<{ inserted: number; errors: { row: number; line: string; reason: string }[]; totalLines: number }>('/competitors/upload-csv', { method: 'POST', body: JSON.stringify({ csv }) }),
+  aiCompetitorLookup: (sku: number) => req<{ sku: number; item: { sku: number; description: string }; results: CompetitorPrice[] }>('/competitors/ai-lookup', { method: 'POST', body: JSON.stringify({ sku }) }),
+  competitorProviderStatus: () => req<{ active: string; provider: string; hasKey: boolean }>('/competitors/provider-status'),
   listRivals: () => req<{ rivals: CompetitorRival[] }>('/competitors/rivals').then((r) => r.rivals),
   scrapeCompetitors: (body: { skus: number[]; rivals?: string[] }) =>
     req<ScrapeResponse>('/competitors/scrape', { method: 'POST', body: JSON.stringify(body) }),

@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { DataStore } from '../store/datastore.js';
 import { config } from '../config.js';
 import type { Item } from '../types.js';
+import { getAnthropic, anthropicConfigured } from '../ai/client.js';
 
 // ----------------------------------------------------------------------------
 // Competitor price intelligence — best-effort live web scraping.
@@ -85,17 +86,29 @@ async function fetchWithTimeout(url: string, timeoutMs: number): Promise<{ ok: t
   }
 }
 
+// Build the actual fetch URL. When a scraping service is configured + the
+// SCRAPING_API_KEY env is set, route through it so the residential proxy +
+// JS renderer handle CAPTCHAs and IP-based blocks. Otherwise fetch direct.
+function resolveFetchUrl(targetUrl: string): { url: string; viaService: string | null } {
+  const svc = config.app.competitors.scrapingService;
+  const key = process.env.SCRAPING_API_KEY ?? '';
+  if (!svc || svc.provider === 'none' || !key || !svc.endpoint) return { url: targetUrl, viaService: null };
+  const url = svc.endpoint.replace('{key}', encodeURIComponent(key)).replace('{url}', encodeURIComponent(targetUrl));
+  return { url, viaService: svc.provider };
+}
+
 async function scrapeOne(sku: number, item: Item, rival: { key: string; name: string; searchUrl: string }, timeoutMs: number): Promise<CompetitorPrice> {
   const q = encodeURIComponent(item.description);
-  const url = rival.searchUrl.replace('{q}', q);
+  const targetUrl = rival.searchUrl.replace('{q}', q);
+  const { url, viaService } = resolveFetchUrl(targetUrl);
   const at = new Date().toISOString();
-  const res = await fetchWithTimeout(url, timeoutMs);
+  const res = await fetchWithTimeout(url, viaService ? timeoutMs * 2 : timeoutMs);
   if (!res.ok) {
-    return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: res.reason, message: res.message, url, fetchedAt: at };
+    return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: res.reason, message: res.message, url: targetUrl, fetchedAt: at };
   }
   const price = parsePrice(res.html);
-  if (price == null) return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: 'NOT_FOUND', message: 'no price pattern found', url, fetchedAt: at };
-  return { sku, rivalKey: rival.key, rivalName: rival.name, price, status: 'OK', message: null, url, fetchedAt: at };
+  if (price == null) return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: 'NOT_FOUND', message: 'no price pattern found', url: targetUrl, fetchedAt: at };
+  return { sku, rivalKey: rival.key, rivalName: rival.name, price, status: 'OK', message: null, url: targetUrl, fetchedAt: at };
 }
 
 export async function competitorRoutes(app: FastifyInstance, ds: DataStore) {
@@ -177,5 +190,117 @@ export async function competitorRoutes(app: FastifyInstance, ds: DataStore) {
     }
     lines.sort((a, b) => Math.abs(b.gapPct) - Math.abs(a.gapPct));
     return { totalCovered: lines.length, lines: lines.slice(0, limit) };
+  });
+
+  // GET /competitors/provider-status — reports the active fetch path so the
+  // UI can tell users whether they're going direct or through a service.
+  app.get('/competitors/provider-status', async () => {
+    const svc = config.app.competitors.scrapingService;
+    const key = process.env.SCRAPING_API_KEY ?? '';
+    const active = (svc && svc.provider !== 'none' && key) ? svc.provider : 'direct';
+    return { active, provider: svc?.provider ?? 'none', hasKey: Boolean(key) };
+  });
+
+  // POST /competitors/upload-csv  body: { csv: string }
+  // CSV header (case-insensitive): sku,rivalKey,price[,observedAt[,source]]
+  // Always works — no scraping involved. Buyer pastes what they saw on a
+  // store visit, vendor sent over, or a paid intelligence feed exported.
+  app.post('/competitors/upload-csv', async (req, reply) => {
+    const body = (req.body as any) ?? {};
+    const csv = String(body.csv ?? '').trim();
+    if (!csv) return reply.code(400).send({ error: 'bad_request', message: 'csv is required' });
+
+    const rivalKeys = new Set(config.app.competitors.rivals.map((r) => r.key.toUpperCase()));
+    const rivalNameByKey = new Map(config.app.competitors.rivals.map((r) => [r.key.toUpperCase(), r.name]));
+    const cache = getCache();
+    const errors: { row: number; line: string; reason: string }[] = [];
+    let inserted = 0;
+
+    const lines = csv.split(/\r?\n/);
+    // Detect header
+    const firstCols = lines[0]?.toLowerCase().split(',').map((c) => c.trim()) ?? [];
+    const hasHeader = firstCols.includes('sku') && firstCols.some((c) => /rival|retailer/i.test(c)) && firstCols.some((c) => /price/i.test(c));
+    let colSku = 0, colRival = 1, colPrice = 2, colObs = 3, colSrc = 4;
+    let start = 0;
+    if (hasHeader) {
+      colSku = firstCols.findIndex((c) => c === 'sku');
+      colRival = firstCols.findIndex((c) => /rival|retailer/i.test(c));
+      colPrice = firstCols.findIndex((c) => /price/i.test(c));
+      colObs = firstCols.findIndex((c) => /observ|date/i.test(c));
+      colSrc = firstCols.findIndex((c) => /source|note/i.test(c));
+      start = 1;
+    }
+    const at = new Date().toISOString();
+    for (let i = start; i < lines.length; i++) {
+      const raw = lines[i];
+      if (!raw || !raw.trim()) continue;
+      // crude CSV split — handles quoted commas reasonably
+      const cells = raw.match(/("([^"]|"")*"|[^,]*)(,|$)/g)?.map((c) => c.replace(/,$/, '').trim().replace(/^"|"$/g, '').replace(/""/g, '"')) ?? raw.split(',').map((c) => c.trim());
+      const sku = Number(cells[colSku]);
+      const rivalRaw = (cells[colRival] ?? '').toUpperCase().trim();
+      const price = Number((cells[colPrice] ?? '').replace(/[$,\s]/g, ''));
+      const obs = (cells[colObs] && cells[colObs]!.trim()) || at;
+      const src = (cells[colSrc] ?? '').trim();
+      if (!Number.isFinite(sku)) { errors.push({ row: i + 1, line: raw, reason: 'sku is not a number' }); continue; }
+      if (!rivalKeys.has(rivalRaw)) { errors.push({ row: i + 1, line: raw, reason: `unknown rivalKey '${rivalRaw}' — use one of ${[...rivalKeys].join(', ')}` }); continue; }
+      if (!Number.isFinite(price) || price <= 0 || price > 1000) { errors.push({ row: i + 1, line: raw, reason: 'price must be > 0 and < 1000' }); continue; }
+      cache.set(cacheKey(sku, rivalRaw), {
+        sku, rivalKey: rivalRaw, rivalName: rivalNameByKey.get(rivalRaw) ?? rivalRaw,
+        price, status: 'OK', message: src ? `manual: ${src}` : 'manual upload',
+        url: 'manual://upload', fetchedAt: obs,
+      });
+      inserted++;
+    }
+    return { inserted, errors, totalLines: lines.length - start };
+  });
+
+  // POST /competitors/ai-lookup  body: { sku }
+  // Uses Anthropic's web_search tool to find current competitor prices for one
+  // SKU. Writes hits into the same cache the scrape uses. Useful for one-off
+  // lookups when you don't want to spin up a full batch scrape.
+  app.post('/competitors/ai-lookup', async (req, reply) => {
+    if (!anthropicConfigured()) return reply.code(400).send({ error: 'no_ai_key', message: 'Set ANTHROPIC_API_KEY in the API environment to use AI lookup.' });
+    const sku = Number((req.body as any)?.sku);
+    if (!Number.isFinite(sku)) return reply.code(400).send({ error: 'bad_request', message: 'sku is required' });
+    const item = await ds.getItem(sku);
+    if (!item) return reply.code(404).send({ error: 'not_found', message: `sku ${sku} not in catalog` });
+
+    const rivals = config.app.competitors.rivals;
+    const cache = getCache();
+    const ant = getAnthropic();
+    if (!ant) return reply.code(500).send({ error: 'ai_unavailable' });
+
+    const at = new Date().toISOString();
+    const results: CompetitorPrice[] = [];
+    // One call with the web_search tool enabled — let Claude do the search itself.
+    const prompt = `Find the current online retail price (in USD) of this Family Dollar item at each competitor listed. Use real product matches by brand/size/pack. Return JSON only.\n\nItem: ${item.description}\nDept: ${item.deptName ?? ''}\nVendor: ${item.vendorName ?? ''}\nCompetitors: ${rivals.map((r) => `${r.key}=${r.name}`).join(', ')}\n\nReturn JSON: { "prices": [ { "rivalKey": "DG"|"WMT"|"DT", "price": number|null, "note": string } ] }. Set price to null if you can't find a confident match.`;
+
+    let aiText = '';
+    try {
+      const msg = await ant.messages.create({
+        model: config.anthropic.model,
+        max_tokens: 1024,
+        system: 'You are a retail pricing analyst. Use web search to find current online retail prices at the listed competitors. Be conservative — only report a price you can verify in a search result; otherwise return null. Output JSON only.',
+        // Anthropic's web search tool (May 2025 spec). Falls back to no-search if the model doesn't support it.
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: rivals.length + 1 } as any],
+        messages: [{ role: 'user', content: prompt }],
+      } as any);
+      aiText = msg.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('');
+    } catch (e: any) {
+      return reply.code(502).send({ error: 'ai_lookup_failed', message: e?.message ?? String(e) });
+    }
+    const a0 = aiText.indexOf('{'), b0 = aiText.lastIndexOf('}');
+    let parsed: { prices?: { rivalKey: string; price: number | null; note?: string }[] } = {};
+    if (a0 >= 0 && b0 > a0) { try { parsed = JSON.parse(aiText.slice(a0, b0 + 1)); } catch { /* keep empty */ } }
+
+    for (const r of rivals) {
+      const hit = parsed.prices?.find((p) => String(p.rivalKey).toUpperCase() === r.key.toUpperCase());
+      const rec: CompetitorPrice = hit && hit.price != null && Number.isFinite(hit.price)
+        ? { sku, rivalKey: r.key, rivalName: r.name, price: Number(hit.price), status: 'OK', message: `ai-lookup: ${hit.note ?? ''}`.trim().replace(/:\s*$/, ''), url: 'ai://lookup', fetchedAt: at }
+        : { sku, rivalKey: r.key, rivalName: r.name, price: null, status: 'NOT_FOUND', message: hit?.note ?? 'AI could not confidently match an item', url: 'ai://lookup', fetchedAt: at };
+      cache.set(cacheKey(sku, r.key), rec);
+      results.push(rec);
+    }
+    return { sku, item: { sku: item.sku, description: item.description }, results };
   });
 }

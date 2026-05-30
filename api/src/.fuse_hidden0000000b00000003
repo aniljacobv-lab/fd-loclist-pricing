@@ -33,7 +33,7 @@ export interface MarkdownConfig {
   schedule: MarkdownStep[];
 }
 export interface CompetitorRival { key: string; name: string; searchUrl: string; }
-export interface CompetitorsConfig { rivals: CompetitorRival[]; fetchTimeoutMs: number; scrapeBatchCap: number; scrapingService?: { provider: string; endpoint: string } }
+export interface CompetitorsConfig { rivals: CompetitorRival[]; fetchTimeoutMs: number; scrapeBatchCap: number; }
 
 export interface PennyMarkdownConfig {
   extremeSellThroughPct: number;
@@ -102,7 +102,7 @@ const DEFAULTS: AppConfig = {
       { key: 'DG', name: 'Dollar General', searchUrl: 'https://www.dollargeneral.com/search?q={q}' },
       { key: 'WMT', name: 'Walmart', searchUrl: 'https://www.walmart.com/search?q={q}' },
       { key: 'DT', name: 'Dollar Tree', searchUrl: 'https://www.dollartree.com/search?q={q}' },
-    ], fetchTimeoutMs: 8000, scrapeBatchCap: 25, scrapingService: { provider: 'none', endpoint: 'https://app.scrapingbee.com/api/v1/?api_key={key}&url={url}&render_js=true' },
+    ], fetchTimeoutMs: 8000, scrapeBatchCap: 25,
   },
   leadTimes: { SPARC_STRIP_CHANGE: 10, PRICE_STRIP_PRINT: 7, SEND: 5, EFFECTIVE: 0, BLACKOUT: 0, CUSTOM: 0 },
   pagination: { defaultPageSize: 50, maxPageSize: 500 },

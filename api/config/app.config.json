@@ -36,14 +36,19 @@
     ]
   },
   "competitors": {
-    "$comment": "Live web scraping of competitor sites. Search URL templates use {q} for the URL-encoded item description.",
+    "$comment": "Live web scraping of competitor sites. Search URL templates use {q} for the URL-encoded item description. Big-box retailers block direct crawls — route through a scraping service by setting SCRAPING_API_KEY and scrapingService.provider.",
     "rivals": [
       { "key": "DG", "name": "Dollar General", "searchUrl": "https://www.dollargeneral.com/search?q={q}" },
       { "key": "WMT", "name": "Walmart", "searchUrl": "https://www.walmart.com/search?q={q}" },
       { "key": "DT", "name": "Dollar Tree", "searchUrl": "https://www.dollartree.com/search?q={q}" }
     ],
     "fetchTimeoutMs": 8000,
-    "scrapeBatchCap": 25
+    "scrapeBatchCap": 25,
+    "scrapingService": {
+      "$comment": "When provider != 'none' AND env SCRAPING_API_KEY is set, fetches route through this proxy. {key} = api key, {url} = url-encoded target URL.",
+      "provider": "none",
+      "endpoint": "https://app.scrapingbee.com/api/v1/?api_key={key}&url={url}&render_js=true"
+    }
   },
   "pricing": {
     "marginFloorPct": 15,
