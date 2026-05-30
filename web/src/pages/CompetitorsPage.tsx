@@ -25,11 +25,14 @@ export function CompetitorsPage() {
   const [lookupNote, setLookupNote] = useState<string | null>(null);
   // Provider status
   const [provider, setProvider] = useState<{ active: string; provider: string; hasKey: boolean } | null>(null);
+  const [usage, setUsage] = useState<{ available: boolean; creditsUsed?: number | null; creditsMax?: number | null; creditsRemaining?: number | null; reason?: string } | null>(null);
+
 
   useEffect(() => {
     api.listDepts().then(setDepts);
     api.listRivals().then(setRivals);
     api.competitorProviderStatus().then(setProvider).catch(() => setProvider(null));
+    api.competitorUsage().then(setUsage).catch(() => setUsage(null));
   }, []);
 
   async function doUpload() {
@@ -88,6 +91,8 @@ export function CompetitorsPage() {
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <h2 className="text-xl font-semibold text-slate-900">Competitor price intelligence</h2>
           {provider && <span className={`fd-pill ${provider.active === 'direct' ? 'bg-slate-100 text-slate-600' : 'bg-blue-50 text-blue-700'}`}>fetch: {provider.active}{provider.active !== 'direct' && provider.hasKey ? ' ✓' : ''}</span>}
+          {usage?.available && usage.creditsRemaining != null && <span className={`fd-pill ${usage.creditsRemaining < 100 ? 'bg-red-50 text-red-700' : usage.creditsRemaining < 500 ? 'bg-amber-50 text-amber-700' : 'bg-green-50 text-green-700'}`} title={`${usage.creditsUsed?.toLocaleString()} of ${usage.creditsMax?.toLocaleString()} used this month`}>{usage.creditsRemaining.toLocaleString()} credits left</span>}
+
         </div>
 
         <p className="mt-0.5 text-sm text-slate-500">Live scrape of {rivals.map((r) => r.name).join(', ') || 'configured rivals'} and gap-vs-FD report. Big-box retailers actively block crawlers, so coverage will be partial; the report shows whatever did come through.</p>

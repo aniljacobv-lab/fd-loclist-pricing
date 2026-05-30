@@ -9,14 +9,14 @@ export interface MarketListDef {
   type: 'state' | 'metro' | 'class';
   name: string;
   description?: string;
-  code?: string;       // state or class code
-  city?: string;       // metro
-  state?: string;      // metro
+  code?: string;
+  city?: string;
+  state?: string;
 }
 
 export interface TierThreshold {
-  tier: number;                 // 2..4 (tier 1 is implicit on every PC)
-  weeklyMarginUsd?: number;     // any of these triggers escalation to this tier
+  tier: number;
+  weeklyMarginUsd?: number;
   itemLocations?: number;
   skuCount?: number;
   storeCount?: number;
@@ -33,7 +33,12 @@ export interface MarkdownConfig {
   schedule: MarkdownStep[];
 }
 export interface CompetitorRival { key: string; name: string; searchUrl: string; }
-export interface CompetitorsConfig { rivals: CompetitorRival[]; fetchTimeoutMs: number; scrapeBatchCap: number; scrapingService?: { provider: string; endpoint: string } }
+export interface CompetitorsConfig {
+  rivals: CompetitorRival[];
+  fetchTimeoutMs: number;
+  scrapeBatchCap: number;
+  scrapingService?: { provider: string; endpoint: string; timeoutMs?: number; usageEndpoint?: string };
+}
 
 export interface PennyMarkdownConfig {
   extremeSellThroughPct: number;
@@ -102,7 +107,15 @@ const DEFAULTS: AppConfig = {
       { key: 'DG', name: 'Dollar General', searchUrl: 'https://www.dollargeneral.com/search?q={q}' },
       { key: 'WMT', name: 'Walmart', searchUrl: 'https://www.walmart.com/search?q={q}' },
       { key: 'DT', name: 'Dollar Tree', searchUrl: 'https://www.dollartree.com/search?q={q}' },
-    ], fetchTimeoutMs: 8000, scrapeBatchCap: 25, scrapingService: { provider: 'none', endpoint: 'https://app.scrapingbee.com/api/v1/?api_key={key}&url={url}&render_js=true' },
+    ],
+    fetchTimeoutMs: 8000,
+    scrapeBatchCap: 25,
+    scrapingService: {
+      provider: 'scrapingbee',
+      endpoint: 'https://app.scrapingbee.com/api/v1/?api_key={key}&url={url}&render_js=true&premium_proxy=true&country_code=us&wait_browser=load&block_resources=false',
+      timeoutMs: 30000,
+      usageEndpoint: 'https://app.scrapingbee.com/api/v1/usage?api_key={key}',
+    },
   },
   leadTimes: { SPARC_STRIP_CHANGE: 10, PRICE_STRIP_PRINT: 7, SEND: 5, EFFECTIVE: 0, BLACKOUT: 0, CUSTOM: 0 },
   pagination: { defaultPageSize: 50, maxPageSize: 500 },

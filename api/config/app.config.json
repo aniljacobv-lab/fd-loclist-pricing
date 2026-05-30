@@ -45,9 +45,11 @@
     "fetchTimeoutMs": 8000,
     "scrapeBatchCap": 25,
     "scrapingService": {
-      "$comment": "When provider != 'none' AND env SCRAPING_API_KEY is set, fetches route through this proxy. {key} = api key, {url} = url-encoded target URL.",
-      "provider": "none",
-      "endpoint": "https://app.scrapingbee.com/api/v1/?api_key={key}&url={url}&render_js=true"
+      "$comment": "ScrapingBee. Premium proxy + JS rendering are required to get past Walmart / DG / Amazon-class anti-bot. country_code=us makes prices and shipping logic resolve to US storefronts. {key} and {url} are filled in at request time.",
+      "provider": "scrapingbee",
+      "endpoint": "https://app.scrapingbee.com/api/v1/?api_key={key}&url={url}&render_js=true&premium_proxy=true&country_code=us&wait_browser=load&block_resources=false",
+      "timeoutMs": 30000,
+      "usageEndpoint": "https://app.scrapingbee.com/api/v1/usage?api_key={key}"
     }
   },
   "pricing": {

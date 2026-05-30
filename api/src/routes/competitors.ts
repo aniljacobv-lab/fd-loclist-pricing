@@ -102,12 +102,28 @@ async function scrapeOne(sku: number, item: Item, rival: { key: string; name: st
   const targetUrl = rival.searchUrl.replace('{q}', q);
   const { url, viaService } = resolveFetchUrl(targetUrl);
   const at = new Date().toISOString();
-  const res = await fetchWithTimeout(url, viaService ? timeoutMs * 2 : timeoutMs);
+  const svc = config.app.competitors.scrapingService;
+  const effectiveTimeout = viaService && svc?.timeoutMs ? svc.timeoutMs : timeoutMs;
+  const res = await fetchWithTimeout(url, effectiveTimeout);
+
   if (!res.ok) {
     return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: res.reason, message: res.message, url: targetUrl, fetchedAt: at };
   }
+  // ScrapingBee surfaces failures as JSON in the response body. Catch them
+  // so the gap report shows BLOCKED/ERROR instead of misleading NOT_FOUND.
+  if (viaService && res.html.startsWith('{') && res.html.length < 2000) {
+    try {
+      const j = JSON.parse(res.html);
+      if (j && (j.error || j.message)) {
+        const msg = String(j.error ?? j.message ?? 'service error');
+        const blocked = /block|captcha|ban|forbidden|quota|credits|insufficient/i.test(msg);
+        return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: blocked ? 'BLOCKED' : 'ERROR', message: `${viaService}: ${msg}`, url: targetUrl, fetchedAt: at };
+      }
+    } catch { /* fall through to parse */ }
+  }
   const price = parsePrice(res.html);
-  if (price == null) return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: 'NOT_FOUND', message: 'no price pattern found', url: targetUrl, fetchedAt: at };
+  if (price == null) return { sku, rivalKey: rival.key, rivalName: rival.name, price: null, status: 'NOT_FOUND', message: viaService ? `${viaService}: no price pattern in rendered page` : 'no price pattern found', url: targetUrl, fetchedAt: at };
+
   return { sku, rivalKey: rival.key, rivalName: rival.name, price, status: 'OK', message: null, url: targetUrl, fetchedAt: at };
 }
 
@@ -200,6 +216,35 @@ export async function competitorRoutes(app: FastifyInstance, ds: DataStore) {
     const active = (svc && svc.provider !== 'none' && key) ? svc.provider : 'direct';
     return { active, provider: svc?.provider ?? 'none', hasKey: Boolean(key) };
   });
+
+  // GET /competitors/usage — proxies ScrapingBee's /usage endpoint so the UI
+  // can show monthly credits used / available. Works for any provider whose
+  // config has a usageEndpoint template.
+  app.get('/competitors/usage', async (_req, reply) => {
+    const svc = config.app.competitors.scrapingService;
+    const key = process.env.SCRAPING_API_KEY ?? '';
+    if (!svc || svc.provider === 'none' || !svc.usageEndpoint || !key) {
+      return { available: false, reason: 'no scraping service configured' };
+    }
+    const url = svc.usageEndpoint.replace('{key}', encodeURIComponent(key));
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (!r.ok) return reply.code(502).send({ available: false, reason: `usage api ${r.status}` });
+      const j = await r.json() as any;
+      // ScrapingBee shape: { max_api_credit, used_api_credit, max_concurrency, ... }
+      return {
+        available: true, provider: svc.provider,
+        creditsUsed: j.used_api_credit ?? j.creditsUsed ?? null,
+        creditsMax: j.max_api_credit ?? j.creditsMax ?? null,
+        creditsRemaining: (typeof j.max_api_credit === 'number' && typeof j.used_api_credit === 'number') ? j.max_api_credit - j.used_api_credit : null,
+        maxConcurrency: j.max_concurrency ?? null,
+        raw: j,
+      };
+    } catch (e: any) {
+      return reply.code(502).send({ available: false, reason: e?.message ?? String(e) });
+    }
+  });
+
 
   // POST /competitors/upload-csv  body: { csv: string }
   // CSV header (case-insensitive): sku,rivalKey,price[,observedAt[,source]]
