@@ -127,6 +127,38 @@ async function scrapeOne(sku: number, item: Item, rival: { key: string; name: st
   return { sku, rivalKey: rival.key, rivalName: rival.name, price, status: 'OK', message: null, url: targetUrl, fetchedAt: at };
 }
 
+// ----- async scrape job manager ----------------------------------------
+// Render (and most PaaS reverse proxies) close the HTTP connection after
+// ~60s. ScrapingBee premium-proxy + JS-render is 10-30s per call, and
+// many plans cap concurrency at 1, so a 25-SKU x 3-rival batch can take
+// minutes. We fire-and-forget the work into a process-memory job and
+// expose progress + results via polling.
+type ScrapeJobStatus = 'RUNNING' | 'DONE' | 'FAILED' | 'CANCELLED';
+interface ScrapeJob {
+  jobId: number;
+  status: ScrapeJobStatus;
+  startedAt: string;
+  finishedAt: string | null;
+  message: string | null;
+  skus: number[];
+  rivals: string[];               // rivalKey list
+  total: number;                  // skus.length * rivals.length
+  completed: number;
+  blockedRivals: string[];
+  results: CompetitorPrice[];     // appended as each (sku,rival) finishes
+}
+const scrapeJobs = new Map<number, ScrapeJob>();
+let scrapeJobSeq = 1;
+const SCRAPE_JOB_TTL_MS = 30 * 60 * 1000;
+
+function gcScrapeJobs() {
+  const now = Date.now();
+  for (const [id, j] of scrapeJobs) {
+    const finishedMs = j.finishedAt ? new Date(j.finishedAt).getTime() : 0;
+    if (j.status !== 'RUNNING' && finishedMs && (now - finishedMs) > SCRAPE_JOB_TTL_MS) scrapeJobs.delete(id);
+  }
+}
+
 export async function competitorRoutes(app: FastifyInstance, ds: DataStore) {
   app.get('/competitors/rivals', async () => ({ rivals: config.app.competitors.rivals.map((r) => ({ key: r.key, name: r.name })) }));
 
@@ -215,6 +247,84 @@ export async function competitorRoutes(app: FastifyInstance, ds: DataStore) {
     const key = process.env.SCRAPING_API_KEY ?? '';
     const active = (svc && svc.provider !== 'none' && key) ? svc.provider : 'direct';
     return { active, provider: svc?.provider ?? 'none', hasKey: Boolean(key) };
+  });
+
+  // POST /competitors/scrape-job  body: { skus: number[], rivals?: string[] }
+  // Starts a background scrape and returns a jobId immediately. The actual
+  // work runs after the HTTP response is sent so Render's 60s timeout
+  // doesn't kill it. Results stream into the cache as each call completes;
+  // poll GET /competitors/scrape-job/:id for progress + the running list.
+  app.post('/competitors/scrape-job', async (req, reply) => {
+    gcScrapeJobs();
+    const body = (req.body as any) ?? {};
+    const skus: number[] = Array.isArray(body.skus) ? body.skus.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n)) : [];
+    if (skus.length === 0) return reply.code(400).send({ error: 'bad_request', message: 'skus is required' });
+    // ScrapingBee credit cost is significant — keep job size bounded even
+    // when caller is enthusiastic.
+    const JOB_MAX_SKUS = 200;
+    if (skus.length > JOB_MAX_SKUS) return reply.code(400).send({ error: 'bad_request', message: `up to ${JOB_MAX_SKUS} SKUs per job` });
+    const rivalFilter: Set<string> | null = Array.isArray(body.rivals) && body.rivals.length > 0 ? new Set(body.rivals.map((r: any) => String(r).toUpperCase())) : null;
+    const rivals = config.app.competitors.rivals.filter((r) => !rivalFilter || rivalFilter.has(r.key));
+
+    const job: ScrapeJob = {
+      jobId: scrapeJobSeq++, status: 'RUNNING',
+      startedAt: new Date().toISOString(), finishedAt: null, message: null,
+      skus, rivals: rivals.map((r) => r.key),
+      total: skus.length * rivals.length, completed: 0,
+      blockedRivals: [], results: [],
+    };
+    scrapeJobs.set(job.jobId, job);
+
+    // Background runner — runs after the response is flushed.
+    setImmediate(async () => {
+      const cache = getCache();
+      const timeout = config.app.competitors.fetchTimeoutMs;
+      try {
+        for (const sku of skus) {
+          const item = await ds.getItem(sku);
+          if (!item) {
+            // Skip this SKU's slots so completed still advances.
+            for (const r of rivals) {
+              const at = new Date().toISOString();
+              const res: CompetitorPrice = { sku, rivalKey: r.key, rivalName: r.name, price: null, status: 'ERROR', message: 'sku not in catalog', url: 'unknown', fetchedAt: at };
+              job.results.push(res); job.completed++;
+            }
+            continue;
+          }
+          // Run the three rivals for this SKU in parallel — ScrapingBee will
+          // still serialize them if max_concurrency=1 on the account, but at
+          // higher tiers this is a real speedup.
+          const settled = await Promise.all(rivals.map((r) => scrapeOne(sku, item, r, timeout)));
+          for (const rec of settled) {
+            cache.set(cacheKey(rec.sku, rec.rivalKey), rec);
+            job.results.push(rec);
+            job.completed++;
+            if (rec.status === 'BLOCKED' && !job.blockedRivals.includes(rec.rivalKey)) job.blockedRivals.push(rec.rivalKey);
+          }
+        }
+        job.status = 'DONE';
+      } catch (e: any) {
+        job.status = 'FAILED';
+        job.message = e?.message ?? String(e);
+      } finally {
+        job.finishedAt = new Date().toISOString();
+      }
+    });
+
+    return reply.code(202).send({ jobId: job.jobId, total: job.total, skuCount: skus.length, rivalCount: rivals.length, status: job.status });
+  });
+
+  // GET /competitors/scrape-job/:id — progress poll.
+  app.get('/competitors/scrape-job/:id', async (req, reply) => {
+    const id = Number((req.params as any).id);
+    const job = scrapeJobs.get(id);
+    if (!job) return reply.code(404).send({ error: 'not_found' });
+    // Return a copy so client mutations don't affect the live job.
+    return {
+      jobId: job.jobId, status: job.status, startedAt: job.startedAt, finishedAt: job.finishedAt,
+      message: job.message, total: job.total, completed: job.completed,
+      blockedRivals: [...job.blockedRivals], results: [...job.results],
+    };
   });
 
   // GET /competitors/usage — proxies ScrapingBee's /usage endpoint so the UI

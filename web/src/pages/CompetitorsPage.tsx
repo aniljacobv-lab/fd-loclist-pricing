@@ -14,6 +14,7 @@ export function CompetitorsPage() {
   const [scrape, setScrape] = useState<ScrapeResponse | null>(null);
   const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState<string>('');
+  const [progress, setProgress] = useState<{ completed: number; total: number; blocked: string[] } | null>(null);
 
   // CSV upload state
   const [csvText, setCsvText] = useState('');
@@ -73,14 +74,31 @@ export function CompetitorsPage() {
 
   async function runScrape() {
     if (scope.length === 0) { setPhase('Pick a scope and load items first.'); return; }
-    setBusy(true); setScrape(null); setPhase(`Scraping ${Math.min(25, scope.length)} SKUs × ${rivals.length} rivals — this can take 30–60s as we hit live sites…`);
+    const skus = scope.slice(0, 25).map((i) => i.sku);
+    setBusy(true); setScrape(null); setProgress({ completed: 0, total: skus.length * rivals.length, blocked: [] });
+    setPhase(`Queueing scrape: ${skus.length} SKUs × ${rivals.length} rivals. This runs in the background — premium proxies can take 10–30s per page.`);
     try {
-      const out = await api.scrapeCompetitors({ skus: scope.slice(0, 25).map((i) => i.sku) });
-      setScrape(out);
-      const okCount = out.results.filter((r) => r.status === 'OK').length;
-      const blockedNote = out.blockedRivals.length > 0 ? ` ${out.blockedRivals.join(', ')} blocked our crawler — try a different rival or query the real feed.` : '';
-      setPhase(`Done: ${okCount} of ${out.results.length} requests returned a price.${blockedNote}`);
-      await refreshGap();
+      const job = await api.startScrapeJob(skus);
+      // Poll the job every ~2.5s. Streams results in as they complete so the
+      // user sees progress instead of staring at a spinner.
+      const start = Date.now();
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((r) => setTimeout(r, 2500));
+        const st = await api.getScrapeJob(job.jobId);
+        setProgress({ completed: st.completed, total: st.total, blocked: st.blockedRivals });
+        setScrape({ scraped: skus.length, requested: skus.length, capped: false, blockedRivals: st.blockedRivals, results: st.results });
+        if (st.status !== 'RUNNING') {
+          const okCount = st.results.filter((r) => r.status === 'OK').length;
+          const blockedNote = st.blockedRivals.length ? ` ${st.blockedRivals.join(', ')} blocked.` : '';
+          const took = Math.round((Date.now() - start) / 1000);
+          if (st.status === 'DONE') setPhase(`Done in ${took}s: ${okCount} of ${st.results.length} returned a price.${blockedNote}`);
+          else setPhase(`Job ${st.status}${st.message ? ` — ${st.message}` : ''}`);
+          await refreshGap();
+          await api.competitorUsage().then(setUsage).catch(() => undefined);
+          break;
+        }
+      }
     } catch (e: any) { setPhase(`Error: ${e?.message ?? e}`); }
     finally { setBusy(false); }
   }
@@ -108,7 +126,7 @@ export function CompetitorsPage() {
             </select>
           )}
           <button onClick={loadScope} disabled={kind === 'DEPT' && deptId == null} className="fd-btn fd-btn-ghost">Load scope</button>
-          <button onClick={runScrape} disabled={busy || scope.length === 0} className="fd-btn fd-btn-primary">{busy ? 'Scraping…' : `Scrape competitor prices (${Math.min(25, scope.length)} SKUs)`}</button>
+          <button onClick={runScrape} disabled={busy || scope.length === 0} className="fd-btn fd-btn-primary">{busy ? (progress ? `Scraping /…` : 'Scraping…') : `Scrape competitor prices (${Math.min(25, scope.length)} SKUs)`}</button>
         </div>
       </header>
 
@@ -155,6 +173,18 @@ export function CompetitorsPage() {
           </div>
 
           {phase && <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">{phase}</div>}
+          {progress && progress.total > 0 && (
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+              <div className="mb-1 flex items-center justify-between text-[11px] text-slate-500">
+                <span>Progress</span>
+                <span>{progress.completed} of {progress.total} requests</span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full transition-all" style={{ width: `${Math.min(100, (progress.completed / Math.max(1, progress.total)) * 100)}%`, background: 'var(--brand-primary)' }} />
+              </div>
+            </div>
+          )}
+
 
           {scrape && (
             <section className="fd-card p-5">

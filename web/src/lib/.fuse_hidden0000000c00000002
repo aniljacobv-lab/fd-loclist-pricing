@@ -346,8 +346,6 @@ export const api = {
   // Competitors
   // extra competitor data-paths
   uploadCompetitorCsv: (csv: string) => req<{ inserted: number; errors: { row: number; line: string; reason: string }[]; totalLines: number }>('/competitors/upload-csv', { method: 'POST', body: JSON.stringify({ csv }) }),
-  startScrapeJob: (skus: number[], rivals?: string[]) => req<{ jobId: number; total: number; skuCount: number; rivalCount: number; status: string }>("/competitors/scrape-job", { method: "POST", body: JSON.stringify({ skus, rivals }) }),
-  getScrapeJob: (jobId: number) => req<{ jobId: number; status: "RUNNING" | "DONE" | "FAILED" | "CANCELLED"; startedAt: string; finishedAt: string | null; message: string | null; total: number; completed: number; blockedRivals: string[]; results: CompetitorPrice[] }>("/competitors/scrape-job/" + jobId),
   aiCompetitorLookup: (sku: number) => req<{ sku: number; item: { sku: number; description: string }; results: CompetitorPrice[] }>('/competitors/ai-lookup', { method: 'POST', body: JSON.stringify({ sku }) }),
   competitorProviderStatus: () => req<{ active: string; provider: string; hasKey: boolean }>("/competitors/provider-status"),
   competitorUsage: () => req<{ available: boolean; provider?: string; creditsUsed?: number | null; creditsMax?: number | null; creditsRemaining?: number | null; maxConcurrency?: number | null; reason?: string }>("/competitors/usage"),
